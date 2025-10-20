@@ -119,11 +119,33 @@ export async function putObject(bucketName: string, key: string, file: File): Pr
     await s3Api.put(`/bucket/${bucketName}/${key}`, file, {
         headers: {
             // Set content type based on the file type
-            "Content-Type": file.type || "application/octet-stream", 
-            "Content-Length": file.size.toString(),
+            "Content-Type": file.type || "application/octet-stream"
         },
     });
 }
+
+// export async function putObject(bucketName: string, key: string, file: File) {
+//   const encodedKey = encodeURIComponent(key);
+
+//   try {
+//     const response = await s3Api.put(`/bucket/${bucketName}/${encodedKey}`, file, {
+//       headers: {
+//         "Content-Type": file.type || "application/octet-stream",
+//       },
+//     });
+
+//     console.log("✅ Upload API response:", response.status, response.data);
+
+//     // If no body, still return a message
+//     return {
+//       status: response.status,
+//       message: response.data || "File uploaded successfully",
+//     };
+//   } catch (error: any) {
+//     console.error("❌ Upload error:", error);
+//     throw error;
+//   }
+// }
 
 /**
  * DELETE /api/v1/bucket/{bucket}/{key} -> Delete an object (Expects 204 No Content)
@@ -131,6 +153,8 @@ export async function putObject(bucketName: string, key: string, file: File): Pr
 export async function deleteObject(bucketName: string, key: string): Promise<void> {
     await s3Api.delete(`/bucket/${bucketName}/${key}`);
 }
+
+
 
 /**
  * GET /api/v1/bucket/{bucket}/{key} -> Generate object URL for direct download

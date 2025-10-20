@@ -9,33 +9,14 @@ use axum::{
 use tokio::{fs::{File, self}, io::{AsyncWriteExt}};
 use tokio_util::io::ReaderStream;
 use futures::stream::StreamExt;
-use std::{io::ErrorKind, time::SystemTime,path::PathBuf};
+use std::{io::ErrorKind, time::SystemTime};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize}; // <-- Added Serde for Query Params
 use md5; //ETAG hashing
 use hex; // You may need a hex encoder for the MD5 hash
 // Import necessary public items from the main module (defined in main.rs)
 use crate::{s3_operations::handler_utils, AppError, AppState};
 
-// --- Metadata Structure ---
-// Represents the content of the 'image.jpg.metadata.json' file
-// #[derive(Serialize, Deserialize, Debug)]
-// pub struct ObjectMetadata {
-//     // ETag is typically the MD5 hash of the object content for non-multipart uploads
-//     #[serde(rename = "ETag")]
-//     pub etag: String,
-//     // Content-Type from the request headers
-//     #[serde(rename = "Content-Type")]
-//     pub content_type: String,
-// }
-
-// // Helper to get the metadata path
-// fn metadata_path(object_path: &PathBuf) -> PathBuf {
-//     let mut meta_path = object_path.clone().into_os_string();
-//     meta_path.push(".metadata.json");
-//     PathBuf::from(meta_path)
-// }
 
 
 // S3 PUT Object Operation (Upload) - Handles object upload with streaming to disk
@@ -132,20 +113,7 @@ pub async fn get_object(
     let metadata = file.metadata().await.context("Failed to get file metadata")?;
     let content_length = metadata.len();
     
-    // // 2. Load the metadata JSON
-    // let metadata_json = fs::read_to_string(&metadata_path).await.map_err(|e| {
-    //     if e.kind() == ErrorKind::NotFound {
-    //         // Handle case where metadata file is missing (error state)
-    //         tracing::error!("Metadata file missing for existing object: {}", metadata_path.display());
-    //         AppError::Internal(anyhow::anyhow!("Missing metadata file")) 
-    //     } else {
-    //         AppError::Io(e)
-    //     }
-    // }).context("Failed to read metadata file")?;
-    
-    // let object_meta: ObjectMetadata = serde_json::from_str(&metadata_json)
-    //     .context("Failed to deserialize metadata JSON")?;
-
+   
     let object_meta = handler_utils::load_metadata(&metadata_path).await?;
 
     // 3. Build the response
@@ -221,60 +189,6 @@ pub async fn delete_object(
 
 
 
-// // S3 HEAD Object Operation - Retrieves object metadata without the content.
-// pub async fn head_object(
-//     State(state): State<AppState>,
-//     AxumPath((bucket, key)): AxumPath<(String, String)>,
-// ) -> Result<Response, AppError> {
-//     tracing::info!("HEAD Request: Bucket='{}', Key='{}'", bucket, key);
-
-//     let path = state.object_path(&bucket, &key);
-
-//     let metadata = fs::metadata(&path).await.map_err(|e| {
-//         if e.kind() == ErrorKind::NotFound {
-//             AppError::NotFound(path.display().to_string())
-//         } else {
-//             AppError::Io(e)
-//         }
-//     }).context("Failed to get file metadata for HEAD")?;
-
-//     let content_length = metadata.len();
-//     let modified_time: SystemTime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-
-//     // Convert SystemTime to Utc DateTime and format as HTTP Date header (RFC 7231)
-//     let datetime: DateTime<Utc> = modified_time.into();
-//     let last_modified_str = datetime.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
-
-//     let mut headers = HeaderMap::new();
-    
-//     // Essential S3/HTTP headers
-//     headers.insert(header::CONTENT_LENGTH, content_length.into());
-//     headers.insert(header::LAST_MODIFIED, last_modified_str.parse().unwrap());
-//     headers.insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/octet-stream"));
-    
-//     // ETag mock using Content-Length
-//     // In a real S3 server, you'd calculate and return ETag here.
-//     // For a mock, a static or simple ETag can be used.
-//     // ETag mock using Content-Length (since a full MD5 hash calculation is complex/slow)
-//     headers.insert(header::ETAG, format!("\"{}\"", content_length).parse().unwrap());
-
-
-//     // Manually insert all headers into the response builder
-//     let mut response = Response::builder()
-//         .status(StatusCode::OK)
-//         .body(Body::empty()) // HEAD must have an empty body
-//         // Finalize the response builder and convert to a Response object
-//         .map_err(|e| anyhow::anyhow!("Failed to build HEAD response: {}", e))? 
-//         .into_response();
-
-//     // Insert headers into the Response object itself
-//     response.headers_mut().extend(headers.into_iter());
-
-//     tracing::info!("HEAD success for: {} ({} bytes)", path.display(), content_length);
-
-//     Ok(response)
-// }
-
 
 
 /// S3 HEAD Object Operation - Retrieves object metadata without the content.
@@ -303,20 +217,7 @@ pub async fn head_object(
     let datetime: DateTime<Utc> = modified_time.into();
     let last_modified_str = datetime.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
 
-    // // 2. Read and parse the sidecar metadata JSON file (for ETag and Content-Type)
-    // let metadata_json = fs::read_to_string(&metadata_path).await.map_err(|e| {
-    //     if e.kind() == ErrorKind::NotFound {
-    //         // Treat missing metadata file for an existing object as a Not Found error (or Internal Error, depending on strictness)
-    //         tracing::error!("Metadata file missing for existing object: {}", metadata_path.display());
-    //         AppError::NotFound(path.display().to_string()) 
-    //     } else {
-    //         AppError::Io(e)
-    //     }
-    // }).context("Failed to read metadata file")?;
-    
-    // let object_meta: handler_utils::ObjectMetadata = serde_json::from_str(&metadata_json)
-    //     .context("Failed to deserialize metadata JSON")?;
-
+    //loadjson from helper function handler_utils::load_metadata
     let object_meta = handler_utils::load_metadata(&metadata_path).await?;
     // 3. Build Headers
     let mut headers = HeaderMap::new();
