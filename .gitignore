@@ -1,0 +1,27 @@
+# ======================================
+# 🦀 Rust Backend (backend/)
+# ======================================
+# Cargo build artifacts
+/backend/target/
+/backend/s3_data/
+
+# Cargo-specific files
+/backend/.cargo/
+
+# Backup and temporary files
+/backend/**/*.rs.bk
+/backend/*.log
+/backend/*.tmp
+/backend/*.swp
+/backend/*.swo
+
+
+# ======================================
+# ⚛️ React Frontend (frontend/)
+# ======================================
+# dependencies
+/frontend/node_modules/
+
+# build outputs
+/frontend/build/
+/frontend/dist/

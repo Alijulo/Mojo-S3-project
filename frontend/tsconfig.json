@@ -1,0 +1,33 @@
+{
+  "compilerOptions": {
+    /* === Output & Module System === */
+    "target": "ESNext",
+    "module": "ESNext",
+    "lib": ["DOM", "DOM.Iterable", "ESNext"],
+
+    /* === JSX & React Support === */
+    "jsx": "react-jsx",
+
+    /* === Path & Module Resolution === */
+    "moduleResolution": "Node",
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "isolatedModules": true,
+
+    /* === Strictness & Safety === */
+    "strict": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+
+    /* === Build Output (Vite handles bundling) === */
+    "noEmit": true,
+    
+    /* === Optional project structure === */
+    "baseUrl": "./",
+    "paths": {
+      "@/*": ["src/*"]
+    }
+  },
+  "include": ["src"],
+  "exclude": ["node_modules", "dist"]
+}

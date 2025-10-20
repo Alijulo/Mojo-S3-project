@@ -1,0 +1,37 @@
+[package]
+name = "Mojo-S3-Project"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.8.6"
+# For asynchronous file I/O and streaming
+tokio-util = { version = "0.7", features = ["io"] }
+# For custom, ergonomic, and crash-free error handling
+thiserror = "2.0.17"
+
+# For flexible error wrapping in application logic
+anyhow = "1.0"
+# For serialization/deserialization (needed for S3 responses/requests)
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.145"
+# For logging and structured context
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# For building the S3 API Layer (You would use this fully in a real project)
+#s3s = { version = "0.11.1", features = ["axum"] } 
+
+# For demonstration: standard HTTP types
+http = "1.0"
+futures = "0.3"
+quick-xml = { version = "0.38.3", features = ["serialize"] }
+chrono = { version = "0.4", features = ["serde"] }
+tower-http = { version = "0.6.6", features = ["cors"] }
+md5 = "0.8.0"
+hex = "0.4"
+
+
+
+
