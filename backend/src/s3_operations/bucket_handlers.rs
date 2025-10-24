@@ -336,6 +336,52 @@ pub async fn head_bucket(
 
 
 
+// Add this new function to your file
+/// S3 GET Bucket Location Operation (GET /<bucket>?location) - Returns the region.
+pub async fn get_bucket_location(
+    State(state): State<AppState>,
+    AxumPath(bucket): AxumPath<String>,
+) -> Result<(HeaderMap, String), AppError> {
+    tracing::info!("GET /{}?location Request: Retrieving bucket location (XML).", bucket);
+
+    let path = state.bucket_path(&bucket);
+
+    // 1. Check if the bucket exists (S3 returns 404 if it doesn't)
+    match fs::metadata(&path).await {
+        Ok(metadata) => {
+            if !metadata.is_dir() {
+                // If the path exists but isn't a directory, treat as not found for a bucket operation
+                return Err(AppError::NotFound(bucket));
+            }
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            return Err(AppError::NotFound(bucket));
+        }
+        Err(e) => {
+            tracing::error!("Failed to check bucket {}: {}", bucket, e);
+            return Err(AppError::Io(e));
+        }
+    }
+
+    // 2. Mock Location Constraint response
+    // S3 returns an empty body for us-east-1 (the default) or an XML body for other regions.
+    // We'll mock a non-default region to provide the proper XML structure.
+    const MOCK_REGION: &str = "us-west-2";
+
+    let xml_body = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><LocationConstraint xmlns="{}">{}</LocationConstraint>"#,
+        S3_XMLNS, MOCK_REGION
+    );
+
+    let mut headers = HeaderMap::new();
+    headers.insert(axum::http::header::CONTENT_TYPE, axum::http::header::HeaderValue::from_static("application/xml"));
+
+    tracing::info!("Location response for '{}': {}", bucket, MOCK_REGION);
+    Ok((headers, xml_body))
+}
+
+
+
 
 
 // S3 LIST Objects Operation (GET /{bucket}) - Lists all files and their sizes in a bucket.

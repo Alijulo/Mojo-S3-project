@@ -28,10 +28,27 @@ mod s3_operations;
 use s3_operations::bucket_handlers::{get_all_buckets, list_objects, put_bucket, delete_bucket,head_bucket};
 use s3_operations::object_handlers::{put_object, get_object, delete_object,head_object};
 
+// 1. Import modules and structs from your files
+use s3_operations::admin_user::{initialize_database, verify_credentials, User};
+use s3_operations::jwt_validation_utils::{create_token, CurrentUser};
 
 // --- 0. Shared S3-Standard XML Response Structs (Made Public) ---
 
 pub const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
+
+
+// --- JWT Authentication Request/Response Structures ---
+
+#[derive(Deserialize)]
+struct AuthRequest {
+    username: String,
+    password: String,
+}
+
+#[derive(Serialize)]
+struct AuthResponse {
+    token: String,
+}
 
 // --- List Buckets (GET /) ---
 
@@ -171,6 +188,7 @@ impl From<anyhow::Error> for AppError {
 #[derive(Clone)]
 pub struct AppState {
     pub storage_root: PathBuf,
+    pub pool: SqlitePool,
 }
 
 impl AppState {
@@ -185,6 +203,36 @@ impl AppState {
     }
 }
 
+
+// --- 3. Authentication Handler (Login) ---
+
+/// Handles user login, verifies credentials, and returns a JWT.
+async fn login_handler(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<AuthRequest>,
+) -> Result<Json<AuthResponse>, AppError> { // Use AppError for unified error handling
+    
+    // 3. Use verify_credentials to check the username and password
+    match verify_credentials(&state.pool, &payload.username, &payload.password).await {
+        Ok(Some(user)) => {
+            // Credentials are valid, create the token
+            let token = create_token(&user.username, &user.role)
+                .context("Failed to create JWT token")?;
+            
+            // Return the token to the client
+            Ok(Json(AuthResponse { token }))
+        }
+        Ok(None) => {
+            // User not found or password mismatch - return UNAUTHORIZED/Access Denied
+            Err(AppError::AccessDenied) 
+        }
+        Err(e) => {
+            // Database or Argon2 error - propagate as internal
+            Err(AppError::Internal(e.into()))
+        }
+    }
+}
+
 //===========================
 // --- 4. Main Entry Point ---
 //============================
@@ -196,7 +244,21 @@ async fn main() -> Result<(), anyhow::Error> {
         .with_max_level(Level::INFO)
         .init();
 
-    info!("Starting Rust S3 Server Skeleton...");
+    info!("Starting Mojo S3 Server...");
+    // --- Database Setup ---
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| {
+            info!("DATABASE_URL not set. Using default 'sqlite:data/app.db'.");
+            "sqlite:data/app.db".to_string()
+        });
+        
+    let pool = SqlitePool::connect(&database_url).await
+        .context(format!("Failed to connect to database at: {}", database_url))?;
+
+    // Initialize database schema and admin user
+    initialize_database(&pool).await?;
+
+    info!("Database initialized successfully.");
 
     // Define the root directory for storage.
     let storage_root = Path::new("./s3_data").to_path_buf();
@@ -204,7 +266,9 @@ async fn main() -> Result<(), anyhow::Error> {
     
     info!("Local Storage Root set to: {}", storage_root.display());
 
-    let state = AppState { storage_root };
+    //let state = AppState { storage_root };
+    // --- Application State ---
+    let state = Arc::new(AppState { storage_root, pool });
 
     // Configure CORS Layer to allow requests from any origin (or specify a frontend URL)
     let cors = CorsLayer::new()
