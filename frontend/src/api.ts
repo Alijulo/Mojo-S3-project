@@ -74,6 +74,37 @@ const s3Api = axios.create({
     baseURL: BASE_URL,
 });
 
+
+// Automatically add the JWT token to every request
+s3Api.interceptors.request.use((config) => {
+  const token = localStorage.getItem("authToken");
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
+
+// ✅ Handle unauthorized errors globally
+s3Api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401 || error.response?.status === 403) {
+      // Token expired or invalid → clear it and redirect to login
+      localStorage.removeItem("authToken");
+      window.location.href = "/login";
+    }
+    return Promise.reject(error);
+  }
+);
+
+export async function login(username: string, password: string) {
+  const response = await s3Api.post("/login", { username, password });
+  const token = response.data.token;
+  localStorage.setItem("authToken", token);
+  return token;
+}
+
 // --- 4. S3 Operation Functions ---
 
 /**
