@@ -15,6 +15,7 @@ dependencies = [
  "bcrypt",
  "chrono",
  "dashmap",
+ "dotenvy",
  "futures",
  "headers",
  "hex",

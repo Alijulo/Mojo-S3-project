@@ -12,6 +12,7 @@ pub struct User {
     pub role: String,
 }
 
+
 pub async fn initialize_database(pool: &SqlitePool) -> Result<()> {
     info!("Starting database initialization and schema setup...");
 
@@ -76,15 +77,13 @@ pub async fn initialize_database(pool: &SqlitePool) -> Result<()> {
     if count.0 == 0 {
         // 5. Initialize Admin User
         let admin_user = env::var("MOJO_ROOT_USER")
-            .or_else(|_| env::var("MOJO_ROOT_USER"))
             .unwrap_or_else(|_| {
                 eprintln!("MOJO_ROOT_USER not set. Using default 'admin'.");
                 "admin".to_string()
             });
 
         let admin_pass = env::var("MOJO_ROOT_PASSWORD")
-            .or_else(|_| env::var("MOJO_ROOT_PASSWORD"))
-            .map_err(|_| anyhow::anyhow!("MOJO_ROOT_PASSWORD or MINIO_ROOT_PASSWORD must be set in .env"))?;
+            .map_err(|_| anyhow::anyhow!("MOJO_ROOT_PASSWORD must be set in .env"))?;
 
         // Validate admin username and password
         if admin_user.trim().is_empty() {
@@ -94,7 +93,8 @@ pub async fn initialize_database(pool: &SqlitePool) -> Result<()> {
             return Err(anyhow::anyhow!("Admin password cannot be empty"));
         }
 
-        let hashed_password = hash_password(&admin_pass)?;
+        let hashed_password = hash(&admin_pass, DEFAULT_COST)
+            .context("Failed to hash admin password")?;
         
         info!("Inserting initial admin user: '{}'", admin_user);
         

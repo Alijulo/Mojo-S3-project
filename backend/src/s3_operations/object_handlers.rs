@@ -129,7 +129,7 @@ pub async fn put_object(
     file.flush().await.context("Failed to flush file data")?;
 
     // Calculate ETag
-    let digest_array: [u8; 16] = md5_context.compute().into();
+    let digest_array: [u8; 16] = md5_context.finalize().into();
     let etag = format!("\"{}\"", hex::encode(digest_array));
 
     // Save metadata

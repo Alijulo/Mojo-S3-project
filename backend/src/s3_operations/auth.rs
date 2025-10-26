@@ -3,18 +3,19 @@ use axum::{
     middleware::{Next},
     response::{IntoResponse, Response},
     Extension,
+      extract::{State},
 };
+use std::sync::Arc;
 use base64::prelude::*;
 use sqlx::SqlitePool;
 use bcrypt::verify;
 use dashmap::DashMap;
 use lazy_static::lazy_static;
-use std::sync::Arc;
 use chrono::{DateTime, Utc, Duration};
 use anyhow::{Context, Result};
 use crate::s3_operations::user_models::{verify_credentials, User};
 use crate::s3_operations::jwt_utils::validate_jwt;
-use crate::AppError;
+use crate::{AppError, AppState};
 
 // Constants for authentication prefixes
 const BEARER_PREFIX: &str = "Bearer ";
@@ -321,12 +322,29 @@ pub async fn authenticate_request(
         })
 }
 
+// pub async fn auth_middleware(
+//     Extension(pool): Extension<SqlitePool>,
+//     mut request: Request<axum::body::Body>,
+//     next: Next,
+// ) -> Result<Response, Response> {
+//     match authenticate_request(request.headers(), &pool).await {
+//         Ok(user) => {
+//             request.extensions_mut().insert(user);
+//             Ok(next.run(request).await)
+//         }
+//         Err(e) => {
+//             tracing::error!("Authentication failed: {:?}", e);
+//             Err((StatusCode::UNAUTHORIZED, format!("{:?}", e)).into_response())
+//         }
+//     }
+// }
+
 pub async fn auth_middleware(
-    Extension(pool): Extension<SqlitePool>,
+    State(state): State<Arc<AppState>>,
     mut request: Request<axum::body::Body>,
     next: Next,
 ) -> Result<Response, Response> {
-    match authenticate_request(request.headers(), &pool).await {
+    match authenticate_request(request.headers(), &state.pool).await {
         Ok(user) => {
             request.extensions_mut().insert(user);
             Ok(next.run(request).await)
@@ -337,7 +355,6 @@ pub async fn auth_middleware(
         }
     }
 }
-
 
 pub async fn check_bucket_permission(
     pool: &SqlitePool,
