@@ -11,6 +11,8 @@ use crate::{
     s3_operations::{handler_utils, auth::{check_bucket_permission, AuthenticatedUser, PermissionLevel}},
     AppState, AppError, ListAllMyBucketsResult, Buckets, Owner, BucketInfo, S3_XMLNS, to_xml_string,
 };
+use sha2::{Digest, Sha256};
+use hex;
 use handler_utils::S3Headers;
 
 // Validates bucket name per AWS S3 naming rules
@@ -117,18 +119,20 @@ pub async fn get_all_buckets(
 }
 
 /// Utility function to get owner information
+/// Returns a stable, AWS-compatible 64-character canonical ID
 pub fn get_owner_info() -> Owner {
-    Owner {
-        id: std::env::var("S3_OWNER_ID").unwrap_or_else(|_| {
-            let mut canonical_id = String::with_capacity(64);
-            for _ in 0..4 {
-                canonical_id.push_str(&Uuid::new_v4().simple().to_string());
-            }
-            canonical_id
-        }),
-        display_name: std::env::var("S3_OWNER_DISPLAY_NAME")
-            .unwrap_or_else(|_| "mojo-s3-user".to_string()),
-    }
+    // Try to read from environment (optional override)
+    let id = std::env::var("S3_OWNER_ID").unwrap_or_else(|_| {
+        // Stable seed → same ID every run
+        let mut hasher = Sha256::new();
+        hasher.update(b"mojo-s3-canonical-owner");
+        hex::encode(hasher.finalize()) // 64 hex chars
+    });
+
+    let display_name = std::env::var("S3_OWNER_DISPLAY_NAME")
+        .unwrap_or_else(|_| "mojo-s3-user".to_string());
+
+    Owner { id, display_name }
 }
 
 /// S3 DELETE Bucket Operation

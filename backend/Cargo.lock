@@ -26,6 +26,7 @@ dependencies = [
  "quick-xml",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "thiserror",
  "tokio",

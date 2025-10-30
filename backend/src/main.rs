@@ -294,6 +294,7 @@ async fn login_handler(
 // --- Main Entry Point ---
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
+    dotenvy::dotenv().context("Failed to load .env file")?;
     tracing_subscriber::fmt()
         .with_max_level(Level::INFO)
         .init();
@@ -314,7 +315,7 @@ async fn main() -> Result<(), anyhow::Error> {
     // Database Setup
     // dotenvy::dotenv().ok();
     info!("Current working directory: {}", current_dir()?.display());
-    dotenvy::dotenv().context("Failed to load .env file")?;
+
 
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| {

@@ -39,9 +39,11 @@ impl PermissionLevel {
 }
 
 // Cache for authenticated users
+// === FIXED CACHE: Now stores (user_id, role, password_hash) ===
 lazy_static! {
-    static ref USER_CACHE: Arc<DashMap<String, AuthenticatedUser>> = Arc::new(DashMap::new());
+    static ref AUTH_CACHE: Arc<DashMap<String, (i64, String, String)>> = Arc::new(DashMap::new());
 }
+
 
 #[derive(Debug, Clone)]
 pub struct AuthenticatedUser {
@@ -208,35 +210,28 @@ async fn validate_auth(
     result
 }
 
+// === FIXED: validate_credentials — NO DB ON CACHE HIT ===
 async fn validate_credentials(
     pool: &SqlitePool,
     username: &str,
     password: &str,
 ) -> Result<AuthenticatedUser, AuthError> {
-    // Check cache first
-    if let Some(cached_user) = USER_CACHE.get(username) {
-        let user = sqlx::query_as::<_, User>(
-            "SELECT id, username, password_hash, role FROM users WHERE username = ?"
-        )
-        .bind(username)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| {
-            tracing::error!("Database error for cached user: {}", e);
-            AuthError::InvalidCredentials
-        })?;
-
-        if let Some(user) = user {
-            if verify(password, &user.password_hash).map_err(|e| {
-                tracing::error!("Failed to verify password for user {}: {}", username, e);
-                AuthError::InvalidCredentials
-            })? {
-                tracing::info!("User {} authenticated from cache", username);
-                return Ok(cached_user.clone());
-            }
+    // === 1. FAST PATH: Check cache (no DB, no SQL) ===
+    if let Some(entry) = AUTH_CACHE.get(username) {
+        let (user_id, role, cached_hash) = entry.value(); // <-- FIXED: use .value()
+        if verify(password, cached_hash).map_err(|_| AuthError::InvalidCredentials)? {
+            tracing::info!("User {} authenticated from cache (fast path)", username);
+            return Ok(AuthenticatedUser {
+                username: username.to_string(),
+                user_id: *user_id,
+                role: role.clone(),
+            });
+        } else {
+            tracing::warn!("Password mismatch for cached user: {}", username);
         }
     }
 
+    // === 2. SLOW PATH: DB lookup + verify ===
     match verify_credentials(pool, username, password).await {
         Ok(Some(user)) => {
             let auth_user = AuthenticatedUser {
@@ -244,8 +239,14 @@ async fn validate_credentials(
                 role: user.role.clone(),
                 user_id: user.id,
             };
-            USER_CACHE.insert(username.to_string(), auth_user.clone());
-            tracing::info!("User {} authenticated and cached", username);
+
+            // Cache the hash for future fast checks
+            AUTH_CACHE.insert(
+                username.to_string(),
+                (user.id, user.role.clone(), user.password_hash.clone()),
+            );
+
+            tracing::info!("User {} authenticated and cached (with hash)", username);
             Ok(auth_user)
         }
         Ok(None) => {
@@ -401,4 +402,10 @@ pub async fn check_bucket_permission(
         result
     );
     Ok(result)
+}
+
+
+pub fn invalidate_auth_cache(username: &str) {
+    AUTH_CACHE.remove(username);
+    tracing::info!("Auth cache invalidated for user: {}", username);
 }

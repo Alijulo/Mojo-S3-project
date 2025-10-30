@@ -1,8 +1,10 @@
 use sqlx::{SqlitePool, Row};
-use std::env;
 use anyhow::{Context, Result};
 use bcrypt::{hash, verify, DEFAULT_COST};
 use tracing::info;
+
+// Replace std::env with dotenvy
+use dotenvy::var;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct User {
@@ -11,7 +13,6 @@ pub struct User {
     pub password_hash: String,
     pub role: String,
 }
-
 
 pub async fn initialize_database(pool: &SqlitePool) -> Result<()> {
     info!("Starting database initialization and schema setup...");
@@ -76,13 +77,13 @@ pub async fn initialize_database(pool: &SqlitePool) -> Result<()> {
 
     if count.0 == 0 {
         // 5. Initialize Admin User
-        let admin_user = env::var("MOJO_ROOT_USER")
+        let admin_user = var("MOJO_ROOT_USER")
             .unwrap_or_else(|_| {
                 eprintln!("MOJO_ROOT_USER not set. Using default 'admin'.");
                 "admin".to_string()
             });
 
-        let admin_pass = env::var("MOJO_ROOT_PASSWORD")
+        let admin_pass = var("MOJO_ROOT_PASSWORD")
             .map_err(|_| anyhow::anyhow!("MOJO_ROOT_PASSWORD must be set in .env"))?;
 
         // Validate admin username and password
@@ -96,8 +97,8 @@ pub async fn initialize_database(pool: &SqlitePool) -> Result<()> {
         let hashed_password = hash(&admin_pass, DEFAULT_COST)
             .context("Failed to hash admin password")?;
         
-        info!("Inserting initial admin user: '{}'", admin_user);
-        
+        info!("Inserting initial admin user: '{}',{}", admin_user,admin_pass);
+        info!("Hashed password: '{}'", hashed_password);
         // Insert user and get the resulting ID
         let result = sqlx::query(
             r#"
@@ -318,44 +319,6 @@ pub async fn get_user_bucket_permissions(
     
     Ok(permissions)
 }
-
-// pub async fn check_bucket_permission(
-//     pool: &SqlitePool,
-//     user_id: i64,
-//     bucket_name: &str,
-//     required_permission: &str,
-// ) -> Result<bool> {
-//     let user_role = get_user_role(pool, user_id).await?.context("User not found")?;
-//     if user_role == "admin" {
-//         info!("Admin user {} granted full access to bucket {}", user_id, bucket_name);
-//         return Ok(true);
-//     }
-
-//     let row = sqlx::query(
-//         r#"
-//         SELECT permission_level 
-//         FROM user_bucket_permissions 
-//         WHERE user_id = ? AND bucket_name = ?
-//         "#,
-//     )
-//     .bind(user_id)
-//     .bind(bucket_name)
-//     .fetch_optional(pool)
-//     .await
-//     .context("Failed to check bucket permission")?;
-
-//     let permission: Option<String> = row.map(|r| r.get("permission_level"));
-
-//     match permission.as_deref() {
-//         Some("read-write") => Ok(true),
-//         Some("read-only") => Ok(required_permission == "read-only"),
-//         _ => Ok(false),
-//     }
-// }
-
-
-
-
 
 fn hash_password(password: &str) -> Result<String> {
     hash(password, DEFAULT_COST)
