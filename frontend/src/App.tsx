@@ -4,7 +4,7 @@ import Footer from "./components/Footer";
 import Dashboard from "./components/Dashboard";
 import Buckets from "./components/Buckets";
 import BucketFiles from "./components/BucketFiles";
-import RecentFiles from "./components/RecentFiles";
+// import RecentFiles from "./components/RecentFiles";
 import Login from "./components/Login";
 
 function ProtectedRoute({ children }: { children: JSX.Element }) {
@@ -43,14 +43,6 @@ export default function App() {
             element={
               <ProtectedRoute>
                 <BucketFiles />
-              </ProtectedRoute>
-            }
-          />
-          <Route
-            path="/recentfiles"
-            element={
-              <ProtectedRoute>
-                <RecentFiles />
               </ProtectedRoute>
             }
           />

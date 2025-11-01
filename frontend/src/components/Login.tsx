@@ -1,5 +1,5 @@
 // login.tsx
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { login } from "../api";
 
@@ -10,16 +10,25 @@ export default function Login() {
   const [loading, setLoading] = useState(false);
   const navigate = useNavigate();
 
+  // Clear error when user types
+  useEffect(() => {
+    if (username || password) {
+      setError("");
+    }
+  }, [username, password]);
+
   async function handleLogin(e: React.FormEvent) {
     e.preventDefault();
-    setError("");
-    setLoading(true);
+
+    // DO NOT clear error here — let useEffect handle it
+    // if (error) setError("");  ← REMOVE THIS LINE
 
     if (!username.trim() || !password.trim()) {
       setError("Please enter username and password");
-      setLoading(false);
       return;
     }
+
+    setLoading(true);
 
     try {
       await login(username.trim(), password);
@@ -27,15 +36,22 @@ export default function Login() {
     } catch (err: any) {
       console.error("Login failed:", err);
 
-      if (err.message.includes("missing token")) {
-        setError("Server error: invalid response");
-      } else if (err.response?.status === 403) {
-        setError("Invalid username or password");
+      let message = "Login failed. Check connection.";
+
+      // Prioritize response status
+      if (err.response?.status === 403 || err.response?.status === 401) {
+        message = "Invalid username or password";
       } else if (err.response?.status === 500) {
-        setError("Server error. Try again later.");
-      } else {
-        setError("Login failed. Check connection.");
+        message = "Server error. Try again later.";
+      } else if (err.response?.status >= 400) {
+        message = "Login failed. Please try again.";
+      } else if (!err.response && err.request) {
+        message = "Cannot reach server. Is backend running?";
+      } else if (err.message?.includes("missing token")) {
+        message = "Server error: invalid response";
       }
+
+      setError(message);
     } finally {
       setLoading(false);
     }
@@ -48,10 +64,11 @@ export default function Login() {
           Mojo S3 Admin
         </h2>
 
+        {/* Persistent Error Box */}
         {error && (
-          <p className="text-red-600 text-sm mb-4 p-3 bg-red-50 rounded border border-red-200">
+          <div className="mb-4 p-4 bg-red-50 border border-red-300 text-red-700 rounded-lg text-sm font-medium animate-fade-in">
             {error}
-          </p>
+          </div>
         )}
 
         <form onSubmit={handleLogin} className="space-y-5">
@@ -63,6 +80,7 @@ export default function Login() {
             className="w-full border border-gray-300 px-4 py-3 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 transition"
             required
             disabled={loading}
+            autoFocus
           />
           <input
             type="password"
@@ -75,17 +93,30 @@ export default function Login() {
           />
           <button
             type="submit"
-            disabled={loading}
-            className="w-full bg-indigo-600 hover:bg-indigo-700 text-white py-3 rounded-lg font-medium transition disabled:opacity-50 disabled:cursor-not-allowed"
+            disabled={loading || !username.trim() || !password.trim()}
+            className="w-full bg-indigo-600 hover:bg-indigo-700 text-white py-3 rounded-lg font-medium transition disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center"
           >
-            {loading ? "Signing in..." : "Sign In"}
+            {loading ? (
+              <>
+                <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                Signing in...
+              </>
+            ) : (
+              "Sign In"
+            )}
           </button>
         </form>
 
-        {/* <p className="mt-6 text-xs text-gray-500 text-center">
-          Default: <code className="bg-gray-100 px-1 rounded">admin</code> /{" "}
-          <code className="bg-gray-100 px-1 rounded">My$ecureP@ssword!</code>
-        </p> */}
+        {/* Dev hint */}
+        {/* {import.meta.env.DEV && (
+          <p className="mt-6 text-xs text-gray-500 text-center">
+            Default: <code className="bg-gray-100 px-1 rounded">admin</code> /{" "}
+            <code className="bg-gray-100 px-1 rounded">My$ecureP@ssword!</code>
+          </p>
+        )} */}
       </div>
     </div>
   );
