@@ -264,7 +264,6 @@ async fn login_handler(
 ) -> Result<(HeaderMap, String), AppError> {
     let username = auth.username().to_string();
     let password = auth.password().to_string();
-
     match verify_credentials(&state.pool, &username, &password).await {
         Ok(Some(user)) => {
             let token = generate_jwt(&user)
