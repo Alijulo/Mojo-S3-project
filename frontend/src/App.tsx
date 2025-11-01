@@ -19,7 +19,8 @@ export default function App() {
   return (
     <div className="flex flex-col min-h-screen">
       <Navbar />
-      <main className="flex-grow max-w-5xl mx-auto py-10 px-6 space-y-8">
+      {/* ADD pt-16 to prevent content from hiding under navbar */}
+      <main className="flex-grow max-w-5xl mx-auto py-10 px-6 space-y-8 pt-16">
         <Routes>
           <Route path="/login" element={<Login />} />
           <Route

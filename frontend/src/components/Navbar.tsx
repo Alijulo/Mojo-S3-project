@@ -19,19 +19,19 @@ export default function Navbar() {
   const isActive = (path: string) => location.pathname === path;
 
   return (
-    <nav className="bg-indigo-600 text-white shadow-lg">
+    <nav className="fixed top-0 left-0 right-0 bg-indigo-600 text-white shadow-lg z-50">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
         <div className="flex justify-between items-center h-16">
           {/* Logo */}
           <div className="flex items-center">
-            <Bucket className="h-8 w-8 mr-2" />  {/* ← PascalCase */}
+            <Bucket className="h-8 w-8 mr-2" />
             <h1 className="text-xl font-bold">Mojo S3 Admin</h1>
           </div>
 
           {/* Desktop Links */}
           <div className="hidden md:flex items-center space-x-1">
             <NavLink to="/" icon={<Home size={18} />} label="Dashboard" active={isActive("/")} />
-            <NavLink to="/buckets" icon={<Bucket size={18} />} label="Buckets" active={isActive("/buckets")} />
+            <NavLink to="/buckets" icon={<Bucket className="w-5 h-5" />} label="Buckets" active={isActive("/buckets")} />
             
             <button
               onClick={handleLogout}
@@ -85,7 +85,7 @@ function MobileMenu({ onLogout, isActive }: { onLogout: () => void; isActive: (p
       {open && (
         <div className="absolute right-0 mt-2 w-48 bg-indigo-700 rounded-md shadow-lg py-1 z-50">
           <MobileNavLink to="/" label="Dashboard" icon={<Home size={16} />} active={isActive("/")} onClick={() => setOpen(false)} />
-          <MobileNavLink to="/buckets" label="Buckets" icon={<Bucket size={16} />} active={isActive("/buckets")} onClick={() => setOpen(false)} />
+          <MobileNavLink to="/buckets" label="Buckets" icon={<Bucket className="w-4 h-4" />} active={isActive("/buckets")} onClick={() => setOpen(false)} />
           <div className="border-t border-indigo-600 my-1"></div>
           <button
             onClick={() => {
