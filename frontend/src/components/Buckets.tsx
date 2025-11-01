@@ -26,6 +26,17 @@ function formatBytes(bytes: number): string {
   return `${gb.toFixed(1)} GB`;
 }
 
+function extractXmlErrorMessage(xmlText: string): string {
+  try {
+    const parser = new DOMParser();
+    const xml = parser.parseFromString(xmlText, "application/xml");
+    const msg = xml.querySelector("Message")?.textContent?.trim();
+    return msg || "Unknown server error";
+  } catch {
+    return "Unknown server error";
+  }
+}
+
 export default function Buckets() {
   const [buckets, setBuckets] = useState<BucketWithStats[]>([]);
   const [filteredBuckets, setFilteredBuckets] = useState<BucketWithStats[]>([]);
@@ -35,6 +46,8 @@ export default function Buckets() {
   const [error, setError] = useState("");
   const [sortOrder, setSortOrder] = useState<"asc" | "desc">("desc");
 
+
+  
   const loadBuckets = async () => {
     setError("");
     try {
@@ -86,6 +99,8 @@ export default function Buckets() {
     }
   }, [searchTerm, buckets]);
 
+ 
+
   const handleCreateBucket = async (e: React.FormEvent) => {
     e.preventDefault();
     const bucketName = newBucketName.trim();
@@ -99,17 +114,25 @@ export default function Buckets() {
       await loadBuckets();
     } catch (error) {
       console.error("Failed to create bucket:", error);
+
       let errorMessage = "❌ Failed to create bucket.";
+
       if (isAxiosError(error) && error.response) {
-        errorMessage = `❌ Server Error (${error.response.status}): ${
-          error.response.data || "Could not connect."
-        }`;
+        let serverMessage = "";
+
+        if (typeof error.response.data === "string") {
+          serverMessage = extractXmlErrorMessage(error.response.data);
+        }
+
+        errorMessage = `❌ ${serverMessage || "Server error"}`;
       }
+
       setError(errorMessage);
     } finally {
       setLoading(false);
     }
   };
+
 
   const handleDeleteBucket = async (name: string) => {
     if (!window.confirm(`Are you sure you want to delete bucket '${name}'?`))

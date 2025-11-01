@@ -45,7 +45,7 @@ export default function Dashboard() {
         <main className="flex-1 overflow-auto p-6">
           <div className="max-w-7xl mx-auto space-y-8">
             {/* Welcome */}
-            <section className="text-center">
+            {/* <section className="text-center">
               <h2 className="text-2xl font-bold text-indigo-700">Buckets</h2>
               <p className="text-gray-600 mt-2">
                 MinIO uses buckets to organize objects. A bucket is similar to a folder or directory in a filesystem, where each bucket can hold an arbitrary number of objects.
@@ -53,7 +53,7 @@ export default function Dashboard() {
               <p className="text-indigo-600 mt-4">
                 To get started, <Link to="#" className="underline">Create a Bucket</Link>.
               </p>
-            </section>
+            </section> */}
 
             {/* Stats */}
             <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
@@ -73,16 +73,6 @@ export default function Dashboard() {
               </div>
             </section>
 
-            {/* Pro Tips */}
-            <section className="bg-gradient-to-r from-indigo-50 to-purple-50 rounded-lg p-6 border border-indigo-200">
-              <h3 className="text-lg font-medium text-indigo-800 mb-2">Pro Tips</h3>
-              <ul className="space-y-2 text-sm text-indigo-700">
-                <li>• Use <code className="bg-white px-1 rounded">PUT</code> to create buckets</li>
-                <li>• Buckets must be <strong>globally unique</strong></li>
-                <li>• Delete a bucket only when it's empty</li>
-                <li>• Use <code className="bg-white px-1 rounded">DELETE</code> to remove objects</li>
-              </ul>
-            </section>
           </div>
         </main>
       </div>

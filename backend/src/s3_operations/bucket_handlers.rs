@@ -29,7 +29,7 @@ fn validate_bucket_name(bucket: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-/// S3 PUT Bucket Operation (CREATE)
+// /// S3 PUT Bucket Operation (CREATE)
 pub async fn put_bucket(
     State(state): State<Arc<AppState>>,
     AxumPath(bucket): AxumPath<String>,
@@ -67,6 +67,58 @@ pub async fn put_bucket(
         }
     }
 }
+
+
+/// S3 PUT Bucket Operation (CREATE)
+// pub async fn put_bucket(
+//     State(state): State<Arc<AppState>>,
+//     AxumPath(path): AxumPath<String>,
+//     user: axum::Extension<AuthenticatedUser>,
+// ) -> Result<(StatusCode, HeaderMap), AppError> {
+//     tracing::info!("PUT Bucket Request: Path='{}', User='{}'", path, user.0.username);
+
+//     // Split bucket/subfolder if present
+//     let parts: Vec<&str> = path.split('/').collect();
+//     let bucket = parts[0].to_string();
+//     let sub_path = parts.get(1..).map(|p| p.join("/"));
+
+//     // ✅ Only validate the bucket name
+//     validate_bucket_name(&bucket)?;
+
+//     // ✅ Check bucket-level write permission
+//     if !check_bucket_permission(&state.pool, &user.0, &bucket, PermissionLevel::ReadWrite.as_str())
+//         .await
+//         .map_err(AppError::Internal)?
+//     {
+//         return Err(AppError::AccessDenied);
+//     }
+
+//     // ✅ Determine real filesystem path
+//     let bucket_fs_path = state.bucket_path(&bucket);
+//     let final_path = if let Some(sub) = sub_path {
+//         bucket_fs_path.join(sub)
+//     } else {
+//         bucket_fs_path.clone()
+//     };
+
+//     tracing::info!("Creating filesystem path: {}", final_path.display());
+
+//     match fs::create_dir_all(&final_path).await {
+//         Ok(_) => {
+//             tracing::info!("Created: {}, User: {}", final_path.display(), user.0.username);
+//             Ok((StatusCode::OK, S3Headers::common_headers()))
+//         }
+//         Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+//             tracing::info!("Already exists: {}, User: {}", final_path.display(), user.0.username);
+//             Ok((StatusCode::OK, S3Headers::common_headers()))
+//         }
+//         Err(e) => {
+//             tracing::error!("Failed to create {}: {}, User: {}", final_path.display(), e, user.0.username);
+//             Err(AppError::Io(e))
+//         }
+//     }
+// }
+
 
 /// S3 LIST Buckets Operation (GET /)
 pub async fn get_all_buckets(
@@ -323,5 +375,123 @@ pub async fn get_bucket_encryption(
 
     let headers = S3Headers::xml_headers();
     tracing::info!("Encryption response for '{}': AES256, User: {}", bucket, user.0.username);
+    Ok((headers, xml_body))
+}
+
+
+
+
+//========Get root Storage and no of items
+// === 1. Define the XML struct FIRST ===
+#[derive(serde::Serialize)]
+pub struct RootStorageUsage {
+    #[serde(rename = "TotalBuckets")]
+    total_buckets: u64,
+
+    #[serde(rename = "TotalObjects")]
+    total_objects: u64,
+
+    #[serde(rename = "StorageUsed")]
+    storage_used: String,
+}
+
+// === 2. Define helper BEFORE the handler ===
+fn human_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+//TODO
+// CREATE TABLE bucket_usage (
+//     bucket_name TEXT PRIMARY KEY,
+//     object_count BIGINT NOT NULL DEFAULT 0,
+//     total_bytes BIGINT NOT NULL DEFAULT 0
+// );
+
+
+// === 3. Now define the handler ===
+/// GET /?usage – XML usage summary
+pub async fn get_root_usage(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<AuthenticatedUser>,
+) -> Result<(HeaderMap, String), AppError> {
+    tracing::info!("GET /?usage (XML) – computing for User='{}'", user.0.username);
+
+    let mut total_buckets = 0u64;
+    let mut total_objects = 0u64;
+    let mut total_bytes   = 0u64;
+
+    let mut dir = fs::read_dir(&state.storage_root)
+        .await
+        .with_context(|| "Failed to open storage root")?;
+
+    while let Some(entry) = dir.next_entry()
+        .await
+        .with_context(|| "Failed to read root entry")?
+    {
+        let path = entry.path();
+        if !path.is_dir() { continue; }
+
+        let bucket = path.file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Invalid bucket name")))?;
+
+        if !check_bucket_permission(&state.pool, &user.0, bucket, PermissionLevel::ReadOnly.as_str())
+            .await
+            .map_err(|e| AppError::Internal(e))?
+        {
+            continue;
+        }
+
+        total_buckets += 1;
+
+        let mut bucket_dir = fs::read_dir(&path)
+            .await
+            .with_context(|| format!("Failed to open bucket {bucket}"))?;
+
+        while let Some(obj) = bucket_dir.next_entry()
+            .await
+            .with_context(|| format!("Failed to read object in {bucket}"))?
+        {
+            if obj.path().is_file() {
+                let meta = obj.metadata()
+                    .await
+                    .with_context(|| format!("Failed to stat object in {bucket}"))?;
+                total_objects += 1;
+                total_bytes   += meta.len();
+            }
+        }
+    }
+
+    let usage = RootStorageUsage {
+        total_buckets,
+        total_objects,
+        storage_used: human_bytes(total_bytes),  // used here
+    };
+
+    let xml_body = to_xml_string(&usage)
+        .with_context(|| "Failed to serialize RootStorageUsage to XML")?;
+
+    let headers = S3Headers::xml_headers();
+
+    tracing::info!(
+        "Usage (XML) for '{}': {} buckets, {} objects, {}",
+        user.0.username,
+        total_buckets,
+        total_objects,
+        human_bytes(total_bytes)  // used here again
+    );
+
     Ok((headers, xml_body))
 }

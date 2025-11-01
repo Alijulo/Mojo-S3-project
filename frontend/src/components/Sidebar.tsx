@@ -65,7 +65,7 @@ export default function Sidebar({ isOpen, onToggle }: SidebarProps) {
         />
         {userOpen && (
           <div className="space-y-1">
-            <NavItem icon={<Home size={18} />} label="Object Browser" path="/" active={isActive("/")} isSidebarOpen={isOpen} />
+            <NavItem icon={<Bucket size={18} />} label="Buckets" path="/" active={isActive("/")} isSidebarOpen={isOpen} />
             <NavItem icon={<Key size={18} />} label="Access Keys" path="/access-keys" isSidebarOpen={isOpen} />
             <NavItem icon={<FileText size={18} />} label="Documentation" path="/docs" isSidebarOpen={isOpen} />
           </div>
@@ -80,7 +80,7 @@ export default function Sidebar({ isOpen, onToggle }: SidebarProps) {
         />
         {adminOpen && (
           <div className="space-y-1">
-            <NavItem icon={<Bucket size={18} />} label="Buckets" path="/buckets" active={isActive("/buckets")} isSidebarOpen={isOpen} />
+            <NavItem icon={<Bucket size={18} />} label="Manage Buckets" path="/buckets" active={isActive("/buckets")} isSidebarOpen={isOpen} />
             <NavItem icon={<Shield size={18} />} label="Policies" path="/policies" isSidebarOpen={isOpen} />
             <NavItem icon={<Users size={18} />} label="Identity" path="/identity" isSidebarOpen={isOpen} />
             <NavItem icon={<Activity size={18} />} label="Monitoring" path="/monitoring" isSidebarOpen={isOpen} />
