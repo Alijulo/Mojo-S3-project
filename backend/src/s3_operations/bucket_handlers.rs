@@ -7,14 +7,49 @@ use tokio::fs;
 use std::{sync::Arc, time::SystemTime, io::ErrorKind};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
-use uuid::Uuid;
+use anyhow::anyhow;
 use crate::{
-    s3_operations::{handler_utils, auth::{check_bucket_permission, AuthenticatedUser, PermissionLevel}},
+    s3_operations::{handler_utils, auth::{check_bucket_permission, AuthenticatedUser, PermissionLevel},metadata::{get, set}},
     AppState, AppError, ListAllMyBucketsResult, Buckets, Owner, BucketInfo, S3_XMLNS, to_xml_string,
 };
 use sha2::{Digest, Sha256};
 use hex;
 use handler_utils::S3Headers;
+
+
+
+/// Bucket metadata that lives in the `.s3meta` file
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct BucketMeta {
+    #[serde(default)]
+    quota_bytes: u64,          // 0 = unlimited
+    #[serde(default)]
+    used_bytes: u64,
+    #[serde(default)]
+    object_count: u64,
+    #[serde(default)]
+    versioning: bool,
+    #[serde(default)]
+    created_at: String,        // ISO-8601
+    #[serde(default)]
+    owner: String,
+    #[serde(default)]
+    policy: serde_json::Value,
+    #[serde(default)]
+    encryption: String,        // "none" | "SSE-S3" | …
+}
+
+impl BucketMeta {
+    fn new(owner: &str) -> Self {
+        Self {
+            created_at: chrono::Utc::now().to_rfc3339(),
+            owner: owner.to_string(),
+            encryption: "none".to_string(),
+            ..Default::default()
+        }
+    }
+}
+
 
 // Validates bucket name per AWS S3 naming rules
 fn validate_bucket_name(bucket: &str) -> Result<(), AppError> {
@@ -30,130 +65,33 @@ fn validate_bucket_name(bucket: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-// /// S3 PUT Bucket Operation (CREATE)
-// pub async fn put_bucket(
-//     State(state): State<Arc<AppState>>,
-//     AxumPath(bucket): AxumPath<String>,
-//     user: axum::Extension<AuthenticatedUser>,
-// ) -> Result<(StatusCode, HeaderMap), AppError> {
-//     tracing::info!("PUT Bucket Request: Bucket='{}', User='{}'", bucket, user.0.username);
-
-//     // Validate bucket name
-//     validate_bucket_name(&bucket)?;
-
-//     // Check write permission
-//     if !check_bucket_permission(&state.pool, &user.0, &bucket, PermissionLevel::ReadWrite.as_str())
-//         .await
-//         .map_err(|e| AppError::Internal(e))?
-//     {
-//         return Err(AppError::AccessDenied);
-//     }
-
-//     let path = state.bucket_path(&bucket);
-
-//     match fs::create_dir(&path).await {
-//         Ok(_) => {
-//             tracing::info!("Bucket created: {}, User: {}", path.display(), user.0.username);
-//             let headers = S3Headers::common_headers();
-//             Ok((StatusCode::OK, headers))
-//         },
-//         Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-//             tracing::info!("Bucket already exists: {}, User: {}", path.display(), user.0.username);
-//             let headers = S3Headers::common_headers();
-//             Ok((StatusCode::OK, headers))
-//         },
-//         Err(e) => {
-//             tracing::error!("Failed to create bucket {}: {}, User: {}", bucket, e, user.0.username);
-//             Err(AppError::Io(e))
-//         }
-//     }
-// }
-
-
-
-
-// pub async fn put_bucket(
-//     State(state): State<Arc<AppState>>,
-//     AxumPath((bucket, subpath)): AxumPath<(String, Option<String>)>,
-//     user: axum::Extension<AuthenticatedUser>,
-// ) -> Result<(StatusCode, HeaderMap), AppError> {
-//     tracing::info!("Bucket='{}', Subpath='{:?}', User='{}'", bucket, subpath, user.0.username);
-
-//     validate_bucket_name(&bucket)?;
-
-//     if !check_bucket_permission(
-//         &state.pool,
-//         &user.0,
-//         &bucket,
-//         PermissionLevel::ReadWrite.as_str(),
-//     )
-//     .await
-//     .map_err(AppError::Internal)?
-//     {
-//         return Err(AppError::AccessDenied);
-//     }
-
-//     let bucket_fs_path = state.bucket_path(&bucket);
-//     // let final_path = match subpath {
-//     //     Some(p) => bucket_fs_path.join(p),
-//     //     None => bucket_fs_path.clone(),
-//     // };
-//     let final_path = match subpath {
-//         Some(ref sub) => {
-//             let normalized = sub.replace('/', std::path::MAIN_SEPARATOR.to_string().as_str());
-//             bucket_fs_path.join(normalized)
-//         }
-//         None => bucket_fs_path.clone(),
-//     };
-
-
-//     tracing::info!("Creating dir: {}", final_path.display());
-
-//     match fs::create_dir_all(&final_path).await {
-//         Ok(_) => {
-//             let headers = S3Headers::common_headers();
-//             Ok((StatusCode::OK, headers))
-//         }
-//         Err(ref e) if e.kind() == ErrorKind::AlreadyExists => {
-//             tracing::info!("Already exists: {}", final_path.display());
-//             let headers = S3Headers::common_headers();
-//             Ok((StatusCode::OK, headers))
-//         }
-//         Err(e) => {
-//             tracing::error!("Failed to create {}: {}", final_path.display(), e);
-//             Err(AppError::Io(e))
-//         }
-//     }
-// }
-
-
-
-/**
-S3 PUT Bucket Operation - create bucket only with no subfolder
-*/
+/* --------------------------------------------------------------------- */
+/*  Public router helpers                                                */
+/* --------------------------------------------------------------------- */
 pub async fn put_bucket_no_subpath(
     State(state): State<Arc<AppState>>,
-    AxumPath(bucket): AxumPath<String>,
-    user: Extension<AuthenticatedUser>, // ← extract
-) -> Result<(StatusCode, HeaderMap), AppError> {
-    put_bucket(state, bucket, None, user.0).await  // ← pass `user`, not `user.0`
-}
-/**
-S3 PUT Bucket Operation - create bucket with subfolder
-*/
-pub async fn put_bucket_with_subpath(
-    State(state): State<Arc<AppState>>,
-    AxumPath((bucket, subpath)): AxumPath<(String, String)>,
+    axum::extract::Path(bucket): axum::extract::Path<String>,
     user: Extension<AuthenticatedUser>,
 ) -> Result<(StatusCode, HeaderMap), AppError> {
-    put_bucket(state, bucket, Some(subpath), user.0).await  // ← pass `user`
+    put_bucket(state, bucket, None, user.0).await
 }
 
+pub async fn put_bucket_with_subpath(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path((bucket, subpath)): axum::extract::Path<(String, String)>,
+    user: Extension<AuthenticatedUser>,
+) -> Result<(StatusCode, HeaderMap), AppError> {
+    put_bucket(state, bucket, Some(subpath), user.0).await
+}
+
+/* --------------------------------------------------------------------- */
+/*  Core implementation – now uses metadata::{get,set}                  */
+/* --------------------------------------------------------------------- */
 async fn put_bucket(
     state: Arc<AppState>,
     bucket: String,
     subpath: Option<String>,
-    user: AuthenticatedUser, // ← expects the inner struct
+    user: AuthenticatedUser,
 ) -> Result<(StatusCode, HeaderMap), AppError> {
     let subpath = subpath.as_deref().unwrap_or("");
 
@@ -171,41 +109,82 @@ async fn put_bucket(
         return Err(AppError::AccessDenied);
     }
 
-    let mut headers = S3Headers::common_headers();
-    if subpath.is_empty() {
-        // Bucket creation → add Location
-        headers.insert(header::LOCATION, format!("/{bucket}").parse().unwrap());
+    /* --------------------------------------------------------------- */
+    /*  1. Determine final filesystem path                         */
+    /* --------------------------------------------------------------- */
+    let bucket_root = state.bucket_path(&bucket); // e.g. ./s3_data/my-bucket
+    let final_path = if subpath.is_empty() {
+        bucket_root.clone()
     } else {
-        // Folder creation → add ETag
+        bucket_root.join(subpath)
+    };
+
+    /* --------------------------------------------------------------- */
+    /*  2. Create the directory (idempotent)                        */
+    /* --------------------------------------------------------------- */
+    match fs::create_dir_all(&final_path).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+        Err(e) => {
+            tracing::error!("IO error while creating path: {}", e);
+            return Err(AppError::Io(e));
+        }
+    }
+
+    /* --------------------------------------------------------------- */
+    /*  3. Real bucket creation (no sub-path) → .s3meta + xattr/json  */
+    /* --------------------------------------------------------------- */
+    let mut headers = S3Headers::common_headers();
+
+    if subpath.is_empty() {
+        headers.insert(header::LOCATION, format!("/{bucket}").parse().unwrap());
+
+        let meta_path = bucket_root.join(".s3meta");
+
+        // Create the hidden file if it does not exist
+        //For linux or macOS
+        #[cfg(unix)]{
+            if fs::metadata(&meta_path).await.is_err() {
+                fs::write(&meta_path, b"").await.map_err(AppError::Io)?;
+            }
+        }
+        
+        //For windows
+        #[cfg(not(unix))]
+        {
+            // No action needed: set() will create .s3meta.json
+        }
+
+        // ---- read existing metadata (xattr on Unix, .json on Windows) ----
+        let path_str = meta_path
+            .to_str()
+            .ok_or_else(|| AppError::Internal(anyhow!("non-UTF8 path")))?;
+
+        let meta_json = get(path_str, "user.s3.meta")?
+            .and_then(|v| String::from_utf8(v).ok())
+            .unwrap_or_default();
+
+        // ---- initialise or load BucketMeta ----
+        let meta: BucketMeta = if meta_json.is_empty() {
+            BucketMeta::new(&user.username)
+        } else {
+            serde_json::from_str(&meta_json)
+                .unwrap_or_else(|_| BucketMeta::new(&user.username))
+        };
+
+        // ---- write back (xattr or .json) ----
+        let json = serde_json::to_string(&meta).unwrap();
+        set(path_str, "user.s3.meta", json.as_bytes())?;
+    } else {
+        // ---- folder (prefix) creation – fixed empty-object ETag ----
         headers.insert(
             header::ETAG,
             "\"d41d8cd98f00b204e9800998ecf8427e\"".parse().unwrap(),
         );
     }
 
-
-    let final_path = if subpath.is_empty() {
-        state.bucket_path(&bucket)
-    } else {
-        state.bucket_path(&bucket).join(subpath)
-    };
-
-    tracing::info!("Creating: {}", final_path.display());
-
-    match fs::create_dir_all(&final_path).await {
-        Ok(_) => {
-            Ok((StatusCode::OK, headers))
-        }
-        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-            Ok((StatusCode::OK, headers))
-        }
-        Err(e) => {
-            tracing::error!("IO error: {}", e);
-            Err(AppError::Io(e))
-        }
-    }
+    Ok((StatusCode::OK, headers))
 }
-
 
 
 /// S3 LIST Buckets Operation (GET /)

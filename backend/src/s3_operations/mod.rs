@@ -5,3 +5,4 @@ pub mod user_models;
 pub mod jwt_utils;
 pub mod auth;
 pub mod authextractor;
+pub mod metadata;
