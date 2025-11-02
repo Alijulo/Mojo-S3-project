@@ -138,9 +138,18 @@ export async function listBuckets(): Promise<S3Bucket[]> {
   return parseS3Xml(response.data) as S3Bucket[];
 }
 
-export async function createBucket(bucketName: string): Promise<void> {
-  await s3Api.put(`/bucket/${bucketName}`);
+// export async function createBucket(bucketName: string): Promise<void> {
+//   await s3Api.put(`/bucket/${bucketName}`);
+// }
+
+export async function createBucket(bucketName: string, subpath?: string): Promise<void> {
+  const url = subpath
+    ? `/bucket/${bucketName}/${subpath}`
+    : `/bucket/${bucketName}`;
+
+  await s3Api.put(url);
 }
+
 
 export async function deleteBucket(bucketName: string): Promise<void> {
   await s3Api.delete(`/bucket/${bucketName}`);
@@ -154,7 +163,7 @@ export async function listObjects(bucketName: string): Promise<S3Object[]> {
 }
 
 export async function putObject(bucketName: string, key: string, file: File): Promise<void> {
-  await s3Api.put(`/bucket/${bucketName}/${key}`, file, {
+  await s3Api.put(`/object/${bucketName}/${key}`, file, {
     headers: {
       "Content-Type": file.type || "application/octet-stream"
     },
@@ -162,9 +171,9 @@ export async function putObject(bucketName: string, key: string, file: File): Pr
 }
 
 export async function deleteObject(bucketName: string, key: string): Promise<void> {
-  await s3Api.delete(`/bucket/${bucketName}/${key}`);
+  await s3Api.delete(`/object/${bucketName}/${key}`);
 }
 
 export function getObjectUrl(bucketName: string, key: string): string {
-  return `${BASE_URL}/bucket/${bucketName}/${key}`;
+  return `${BASE_URL}/object/${bucketName}/${key}`;
 }

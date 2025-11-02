@@ -8,6 +8,7 @@ use tokio::fs;
 use axum::http::HeaderMap;
 use uuid::Uuid;
 use quick_xml::se::to_string;
+use base64::{Engine as _, engine::general_purpose};
 
 // Helper to get the metadata path
 pub fn metadata_path(object_path: &PathBuf) -> PathBuf {
@@ -89,14 +90,15 @@ impl S3Headers {
         headers.insert("content-type", content_type.parse().unwrap());
         headers.insert("content-length", content_length.into());
         headers.insert("last-modified", chrono::Utc::now().to_rfc2822().parse().unwrap());
+        headers.insert("connection", "close".parse().unwrap());
         headers
     }
 
     pub fn generate_amz_id_2() -> axum::http::HeaderValue {
         // Generate a realistic AWS x-amz-id-2 format
         let id = format!("{}/{}", 
-            base64::encode(Uuid::new_v4().as_bytes()),
-            base64::encode(Uuid::new_v4().as_bytes())
+            general_purpose::STANDARD.encode(Uuid::new_v4().as_bytes()),
+            general_purpose::STANDARD.encode(Uuid::new_v4().as_bytes())
         );
         id.parse().unwrap()
     }

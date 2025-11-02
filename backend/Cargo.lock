@@ -20,6 +20,7 @@ dependencies = [
  "headers",
  "hex",
  "http",
+ "httpdate",
  "jsonwebtoken",
  "lazy_static",
  "md5",

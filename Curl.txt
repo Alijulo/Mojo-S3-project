@@ -1,0 +1,1 @@
+curl -i -X PUT "http://127.0.0.1:3000/api/v1/bucket/my-bucket/photos/2024" -u "admin:My@ssword!"

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio::fs;
 use axum::{
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post,put},
     extract::{State},
     Router,
     http::{StatusCode, HeaderMap},
@@ -27,7 +27,7 @@ mod s3_operations;
 
 
 // Re-export handler functions
-use s3_operations::bucket_handlers::{get_all_buckets, put_bucket, delete_bucket, head_bucket};
+use s3_operations::bucket_handlers::{get_all_buckets, put_bucket_no_subpath,put_bucket_with_subpath, delete_bucket, head_bucket};
 use s3_operations::object_handlers::{put_object, get_object, list_objects, delete_object, head_object};
 use s3_operations::handler_utils::{S3Error, S3Headers};
 use s3_operations::auth::{auth_middleware,};
@@ -220,42 +220,6 @@ impl AppState {
     }
 }
 
-// // --- Authentication Handler (Login) - Returns XML ---
-// async fn login_handler(
-//     State(state): State<Arc<AppState>>,
-//     Json(payload): Json<AuthRequest>,
-// ) -> Result<(HeaderMap, String), AppError> {
-//     match verify_credentials(&state.pool, &payload.username, &payload.password).await {
-//         Ok(Some(user)) => {
-//             // Use jwt_utils::generate_jwt
-//             let token = generate_jwt(&user)
-//                 .map_err(|e| {
-//                     tracing::error!("Failed to create JWT token: {}", e);
-//                     AppError::Internal(anyhow::anyhow!("Token creation failed"))
-//                 })?;
-            
-//             // Return XML response
-//             let response_data = AuthResponseXml {
-//                 token,
-//                 username: user.username,
-//                 role: user.role,
-//                 user_id: user.id,
-//             };
-
-//             let xml_body = to_xml_string(&response_data)
-//                 .context("Failed to serialize auth response to XML")?;
-
-//             let headers = S3Headers::xml_headers();
-//             Ok((headers, xml_body))
-//         }
-//         Ok(None) => {
-//             Err(AppError::AccessDenied) 
-//         }
-//         Err(e) => {
-//             Err(AppError::Internal(anyhow::anyhow!("Database error: {}", e)))
-//         }
-//     }
-// }
 
 // Authentication Handler
 async fn login_handler(
@@ -400,12 +364,16 @@ async fn main() -> Result<(), anyhow::Error> {
         .route(
             "/api/v1/bucket/{bucket}",
             get(list_objects)
-                .put(put_bucket)
+                .put(put_bucket_no_subpath)
                 .delete(delete_bucket)
                 .head(head_bucket)
         )
         .route(
-            "/api/v1/bucket/{bucket}/{key}",
+        "/api/v1/bucket/{bucket}/{*subpath}",
+        put(put_bucket_with_subpath), // same handler, now receives bucket + subpath
+        )
+        .route(
+            "/api/v1/object/{bucket}/{key}",
             get(get_object)
                 .put(put_object)
                 .delete(delete_object)
