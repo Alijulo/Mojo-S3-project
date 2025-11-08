@@ -177,3 +177,67 @@ export async function deleteObject(bucketName: string, key: string): Promise<voi
 export function getObjectUrl(bucketName: string, key: string): string {
   return `${BASE_URL}/object/${bucketName}/${key}`;
 }
+
+
+// ──────────────────────────────────────────────────────────────────────
+// 6. Bucket Metadata (XML)
+// ──────────────────────────────────────────────────────────────────────
+
+export interface BucketMetadata {
+  quota_bytes: number;
+  used_bytes: number;
+  object_count: number;
+  versioning: boolean;
+  created_at: string;
+  owner: string;
+  policy: string | null;
+  encryption: string;
+  permission: string; // "ReadWrite" | "ReadOnly" | "None"
+}
+
+/**
+ * GET /api/v1/bucket/{bucket}/metadata
+ * Returns the bucket‑metadata XML parsed into a typed object.
+ */
+export async function getBucketMetadata(bucketName: string): Promise<BucketMetadata> {
+  const response: AxiosResponse<string> = await s3Api.get(
+    `/bucket/${bucketName}/metadata`,
+    {
+      responseType: "text",
+      headers: { Accept: "application/xml" },
+    }
+  );
+
+  const xmlString = response.data;
+  const parser = new DOMParser();
+  const xmlDoc = parser.parseFromString(xmlString, "application/xml");
+
+  // ---- S3‑style error handling (re‑use the same pattern as parseS3Xml) ----
+  if (xmlDoc.getElementsByTagName("Error").length > 0) {
+    const code = xmlDoc.getElementsByTagName("Code")[0]?.textContent || "Unknown";
+    const message =
+      xmlDoc.getElementsByTagName("Message")[0]?.textContent || "Unknown error";
+    throw new Error(`S3 Metadata Error: ${code} - ${message}`);
+  }
+
+  const getText = (tag: string) => {
+    const el = xmlDoc.getElementsByTagName(tag)[0];
+    return el?.textContent?.trim() ?? "";
+  };
+
+  const policyText = getText("Policy");
+  const policyValue = policyText === "null" || policyText === "" ? null : policyText;
+
+  return {
+    quota_bytes: Number.parseInt(getText("QuotaBytes")) || 0,
+    used_bytes: Number.parseInt(getText("UsedBytes")) || 0,
+    object_count: Number.parseInt(getText("ObjectCount")) || 0,
+    versioning: getText("Versioning") === "true",
+    created_at: getText("CreatedAt"),
+    owner: getText("Owner"),
+    policy: policyValue,
+    encryption: getText("Encryption"),
+    permission: getText("Permission") || "None",
+  };
+}
+

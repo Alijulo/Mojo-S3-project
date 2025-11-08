@@ -27,7 +27,7 @@ mod s3_operations;
 
 
 // Re-export handler functions
-use s3_operations::bucket_handlers::{get_all_buckets, put_bucket_no_subpath,put_bucket_with_subpath, delete_bucket, head_bucket};
+use s3_operations::bucket_handlers::{get_all_buckets, put_bucket_no_subpath,put_bucket_with_subpath, delete_bucket, head_bucket,get_bucket_metadata};
 use s3_operations::object_handlers::{put_object, get_object, list_objects, delete_object, head_object};
 use s3_operations::handler_utils::{S3Error, S3Headers};
 use s3_operations::auth::{auth_middleware,};
@@ -58,17 +58,7 @@ pub struct AuthResponseXml {
     pub user_id: i64,
 }
 
-// --- List Buckets (GET /) ---
-#[derive(Serialize)]
-#[serde(rename = "ListAllMyBucketsResult")]
-pub struct ListAllMyBucketsResult {
-    #[serde(rename = "@xmlns")]
-    pub xmlns: &'static str,
-    #[serde(rename = "Owner")]
-    pub owner: Owner,
-    #[serde(rename = "Buckets")]
-    pub buckets: Buckets,
-}
+
 
 #[derive(Serialize)]
 pub struct Owner {
@@ -78,19 +68,6 @@ pub struct Owner {
     pub display_name: String,
 }
 
-#[derive(Serialize)]
-pub struct Buckets {
-    #[serde(rename = "Bucket")]
-    pub bucket: Vec<BucketInfo>,
-}
-
-#[derive(Serialize)]
-pub struct BucketInfo {
-    #[serde(rename = "Name")]
-    pub name: String,
-    #[serde(rename = "CreationDate")]
-    pub creation_date: String,
-}
 
 // --- List Objects (GET /{bucket}) ---
 #[derive(Serialize)]
@@ -149,6 +126,8 @@ pub enum AppError {
     BucketNotEmpty,
     #[error("No such key")]
     NoSuchKey,
+    #[error("Invalid bucket name: {0}")]
+    InvalidBucketName(String),
 }
 
 impl IntoResponse for AppError {
@@ -183,6 +162,10 @@ impl IntoResponse for AppError {
             AppError::AccessDenied => (
                 StatusCode::FORBIDDEN,
                 S3Error::access_denied("resource")
+            ),
+            AppError::InvalidBucketName(msg) => (
+                StatusCode::BAD_REQUEST,
+                S3Error::new("InvalidBucketName", &msg, "bucket"),
             ),
             AppError::Internal(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -368,6 +351,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 .delete(delete_bucket)
                 .head(head_bucket)
         )
+        .route("/api/v1/bucket/{bucket}/metadata", get(get_bucket_metadata))
         .route(
         "/api/v1/bucket/{bucket}/{*subpath}",
         put(put_bucket_with_subpath), // same handler, now receives bucket + subpath
