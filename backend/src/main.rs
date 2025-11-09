@@ -128,6 +128,9 @@ pub enum AppError {
     NoSuchKey,
     #[error("Invalid bucket name: {0}")]
     InvalidBucketName(String),
+    #[error("Invalid argument: {0}")]
+    InvalidArgument(String),
+    
 }
 
 impl IntoResponse for AppError {
@@ -166,6 +169,10 @@ impl IntoResponse for AppError {
             AppError::InvalidBucketName(msg) => (
                 StatusCode::BAD_REQUEST,
                 S3Error::new("InvalidBucketName", &msg, "bucket"),
+            ),
+            AppError::InvalidArgument(msg) => (
+                StatusCode::BAD_REQUEST,
+                S3Error::new("InvalidArgument", &msg, "argument"),
             ),
             AppError::Internal(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,

@@ -4,7 +4,7 @@ use axum::{
 };
 
 use tokio::fs;
-use std::{sync::Arc, time::SystemTime, io::ErrorKind};
+use std::{sync::Arc, io::ErrorKind};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use anyhow::anyhow;
@@ -24,23 +24,23 @@ use serde_json::Value;
 // Bucket Metadata
 // ====================================================================
 #[derive(Serialize, Deserialize, Default, Clone)]
-struct BucketMeta {
+pub struct BucketMeta {
     #[serde(default)]
-    quota_bytes: u64, // 0 = no quota
+    pub quota_bytes: u64, // 0 = no quota
     #[serde(default)]
-    used_bytes: u64,
+    pub used_bytes: u64,
     #[serde(default)]
-    object_count: u64,
+    pub object_count: u64,
     #[serde(default)]
-    versioning: bool,
+    pub versioning: bool,
     #[serde(default)]
-    created_at: String, // ISO-8601 RFC3339
+    pub created_at: String, // ISO-8601 RFC3339
     #[serde(default)]
-    owner: String,
+    pub owner: String,
     #[serde(default)]
-    policy: Value,
+    pub policy: Value,
     #[serde(default)]
-    encryption: String, // "none" | "SSE-S3" | "SSE-KMS"
+    pub encryption: String, // "none" | "SSE-S3" | "SSE-KMS"
 }
 
 
