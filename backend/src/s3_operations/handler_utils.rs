@@ -2,13 +2,21 @@ use serde::{Deserialize, Serialize}; // <-- Added Serde for Query Params
 use std::{io::ErrorKind,path::PathBuf};
 use anyhow::Context;
 // Import necessary public items from the main module (defined in main.rs)
-use crate::{AppError};
+use thiserror::Error;
 use tokio::fs;
 // s3_operations/aws_headers.rs
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap,header};
 use uuid::Uuid;
 use quick_xml::se::to_string;
 use base64::{Engine as _, engine::general_purpose};
+use axum::{
+    response::{IntoResponse, Response},
+    http::StatusCode,
+
+};
+use tracing::{error, info, Level};
+
+
 
 // Helper to get the metadata path
 pub fn metadata_path(object_path: &PathBuf) -> PathBuf {
@@ -102,6 +110,11 @@ impl S3Headers {
         );
         id.parse().unwrap()
     }
+    pub fn json_headers() -> HeaderMap {
+        let mut headers = Self::common_headers();
+        headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        headers
+    }
 }
 
 impl S3Error {
@@ -139,4 +152,172 @@ impl S3Error {
     }
 }
 
+
+// --- Authentication Request Structure (JSON input) ---
+#[derive(Deserialize)]
+struct AuthRequest {
+    username: String,
+    password: String,
+}
+
+// --- XML Authentication Response Structures ---
+#[derive(Serialize)]
+#[serde(rename = "AuthResponse")]
+pub struct AuthResponseXml {
+    #[serde(rename = "Token")]
+    pub token: String,
+    #[serde(rename = "Username")]
+    pub username: String,
+    #[serde(rename = "Role")]
+    pub role: String,
+    #[serde(rename = "UserId")]
+    pub user_id: i64,
+}
+
+
+
+#[derive(Serialize)]
+pub struct Owner {
+    #[serde(rename = "ID")]
+    pub id: String,
+    #[serde(rename = "DisplayName")]
+    pub display_name: String,
+}
+
+
+// --- List Objects (GET /{bucket}) ---
+#[derive(Debug, Serialize)]
+pub struct CommonPrefix {
+    #[serde(rename = "Prefix")]
+    pub prefix: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename = "ListBucketResult")]
+pub struct ListBucketResult {
+    #[serde(rename = "@xmlns")]
+    pub xmlns: &'static str,
+    #[serde(rename = "Name")]
+    pub bucket_name: String,
+    #[serde(rename = "Prefix", skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    #[serde(rename = "Delimiter", skip_serializing_if = "Option::is_none")]
+    pub delimiter: Option<String>,
+    #[serde(rename = "Marker", skip_serializing_if = "Option::is_none")]
+    pub marker: Option<String>,
+    #[serde(rename = "MaxKeys")]
+    pub max_keys: u32,
+    #[serde(rename = "IsTruncated")]
+    pub is_truncated: bool,
+    #[serde(rename = "CommonPrefixes", skip_serializing_if = "Vec::is_empty")]
+    pub common_prefixes: Vec<CommonPrefix>,
+    #[serde(rename = "Contents")]
+    pub objects: Vec<ObjectInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ObjectInfo {
+    #[serde(rename = "Key")]
+    pub key: String,
+    #[serde(rename = "LastModified")]
+    pub last_modified: String,
+    #[serde(rename = "ETag")]
+    pub etag: String,
+    #[serde(rename = "Size")]
+    pub size_bytes: u64,
+}
+
+// --- S3-Oriented Custom Error Handling ---
+#[derive(Debug, Error)]
+pub enum AppError {
+    #[error("Storage I/O Error: {0}")]
+    Io(#[from] tokio::io::Error),
+    #[error("Not Found: {0}")]
+    NotFound(String),
+    #[error("Internal Server Error: {0}")]
+    Internal(#[source] anyhow::Error),
+    #[error("Access denied: unauthorized or invalid credentials.")]
+    AccessDenied,
+    #[error("Bucket not empty")]
+    BucketNotEmpty,
+    #[error("No such key")]
+    NoSuchKey,
+    #[error("Invalid bucket name: {0}")]
+    InvalidBucketName(String),
+    #[error("Invalid argument: {0}")]
+    InvalidArgument(String),
+    #[error("Precondition failed")]
+    PreconditionFailed,
+    #[error("Entity too large")]
+    EntityTooLarge,
+    
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        error!("Application Error: {:?}", self);
+
+        let (status, s3_error) = match self {
+            AppError::Io(e) => {
+                match e.kind() {
+                    ErrorKind::NotFound => (
+                        StatusCode::NOT_FOUND,
+                        S3Error::not_found("resource")
+                    ),
+                    _ => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        S3Error::new("InternalError", &format!("Internal error: {}", e), "resource")
+                    ),
+                }
+            },
+            AppError::NotFound(resource) => (
+                StatusCode::NOT_FOUND,
+                S3Error::not_found(&resource)
+            ),
+            AppError::BucketNotEmpty => (
+                StatusCode::CONFLICT,
+                S3Error::bucket_not_empty("bucket")
+            ),
+            AppError::NoSuchKey => (
+                StatusCode::NOT_FOUND,
+                S3Error::no_such_key("key")
+            ),
+            AppError::AccessDenied => (
+                StatusCode::FORBIDDEN,
+                S3Error::access_denied("resource")
+            ),
+            AppError::InvalidBucketName(msg) => (
+                StatusCode::BAD_REQUEST,
+                S3Error::new("InvalidBucketName", &msg, "bucket"),
+            ),
+            AppError::InvalidArgument(msg) => (
+                StatusCode::BAD_REQUEST,
+                S3Error::new("InvalidArgument", &msg, "argument"),
+            ),
+                        AppError::PreconditionFailed => (
+                StatusCode::PRECONDITION_FAILED,
+                S3Error::new("PreconditionFailed", "Precondition failed", "resource"),
+            ),
+            AppError::EntityTooLarge => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                S3Error::new("EntityTooLarge", "The object is too large", "resource"),
+            ),
+            AppError::Internal(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                S3Error::new("InternalError", &format!("Internal error: {}", e), "resource")
+            ),
+        };
+
+        let headers = S3Headers::xml_headers();
+        let body = s3_error.to_xml();
+        
+        (status, headers, body).into_response()
+    }
+}
+
+impl From<anyhow::Error> for AppError {
+    fn from(error: anyhow::Error) -> Self {
+        AppError::Internal(error)
+    }
+}
 

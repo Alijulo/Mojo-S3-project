@@ -6,3 +6,5 @@ pub mod jwt_utils;
 pub mod auth;
 pub mod authextractor;
 pub mod metadata;
+pub mod test;
+pub mod store;

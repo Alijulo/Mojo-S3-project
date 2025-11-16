@@ -4,6 +4,7 @@
 # Cargo build artifacts
 /backend/target/
 /backend/s3_data/
+/backend/data/
 
 # Cargo-specific files
 /backend/.cargo/
