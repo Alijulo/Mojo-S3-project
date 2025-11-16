@@ -14,7 +14,7 @@ export default function BucketFiles() {
   // --- 1. Load Files (GET /api/v1/bucket/{bucket}) ---
   const loadFiles = async () => {
     if (!bucket) return;
-    setMessage("");
+    setMessage((prev) => (prev.startsWith("❌") ? "" : prev));
     try {
       const loadedObjects = await listObjects(bucket);
       setFiles(loadedObjects.sort((a, b) => a.Key.localeCompare(b.Key)));
@@ -41,7 +41,8 @@ export default function BucketFiles() {
     try {
       setUploading(true);
       setMessage("");
-      await putObject(bucket, selectedFile.name, selectedFile);
+      const encodedKey = encodeURIComponent(selectedFile.name);
+      await putObject(bucket, encodedKey, selectedFile);
       setMessage(`✅ Uploaded successfully: ${selectedFile.name}`);
       setSelectedFile(null);
 
@@ -68,7 +69,8 @@ export default function BucketFiles() {
     if (!window.confirm(`Delete file "${key}"? This cannot be undone.`)) return;
 
     try {
-      await deleteObject(bucket, key);
+      const encodedKey = encodeURIComponent(key);
+      await deleteObject(bucket, encodedKey);
       setMessage(`🗑️ File '${key}' deleted.`);
       await loadFiles();
       setTimeout(() => setMessage(""), 3000);

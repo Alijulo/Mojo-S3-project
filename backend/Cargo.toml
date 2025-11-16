@@ -31,7 +31,34 @@ chrono = { version = "0.4", features = ["serde"] }
 tower-http = { version = "0.6.6", features = ["cors"] }
 md5 = "0.8.0"
 hex = "0.4"
+sha2 = "0.10.9"
+
+#SQLite DB
+sqlx = { version = "0.8.6", features = ["runtime-tokio-native-tls", "macros", "sqlite",] }
+
+jsonwebtoken = { version = "10.1.0", default-features = false, features = ["rust_crypto"] }
 
 
+# For secure password hashing
+argon2 = "0.5.3"
+async-trait = "0.1.89"
+axum-extra = { version = "0.12.1", features = ["typed-header"] }
+uuid = { version = "1.0", features = ["v4"] }
+base64 = "0.22.1"
+
+bcrypt = "0.17.1"
+dashmap = "6.0"
+lazy_static = "1.5"
+headers = "0.4.1"
+dotenvy = "0.15.7"
 
 
+# ---- xattr – optional, only on Unix ----
+xattr = { version = "1.3", optional = true }
+futures-util = "0.3.31"
+http-range = "0.1.5"
+httpdate = "1.0.3"
+
+# Explicitly enable it for Unix targets
+[target.'cfg(unix)'.dependencies]
+xattr = { version = "1.3" }

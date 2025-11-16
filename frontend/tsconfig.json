@@ -26,8 +26,15 @@
     "baseUrl": "./",
     "paths": {
       "@/*": ["src/*"]
-    }
+    },
+
+    /* === NEW: Fix Buffer & globalThis errors === */
+    "types": ["node"],                    // Allows Buffer from node types
+    "typeRoots": ["./node_modules/@types", "./src/types"]  // Include custom types
   },
-  "include": ["src"],
+  "include": [
+    "src",
+    "src/types/global.d.ts"               // <-- NEW: Include custom global types
+  ],
   "exclude": ["node_modules", "dist"]
 }

@@ -1,140 +1,243 @@
+// api.ts
 import axios, { AxiosResponse, isAxiosError } from "axios";
+import { Buffer } from "buffer";
+
+// Safe polyfill — TypeScript now knows about globalThis.Buffer
+if (typeof globalThis.Buffer === "undefined") {
+  (globalThis as any).Buffer = Buffer;
+}
+if (typeof globalThis.btoa === "undefined") {
+  globalThis.btoa = (str: string) => Buffer.from(str, "binary").toString("base64");
+}
 
 // --- 1. S3 Type Definitions (Based on your Rust structs) ---
 
-// Corresponds to ListAllMyBucketsResult -> Bucket
 export interface S3Bucket {
-    Name: string;
-    CreationDate: string; // ISO 8601 string
+  Name: string;
+  CreationDate: string; // ISO 8601 string
 }
 
-// Corresponds to ListBucketResult -> Contents
 export interface S3Object {
-    Key: string;
-    LastModified: string; // ISO 8601 string
-    Size: number; // Size in bytes
+  Key: string;
+  LastModified: string; // ISO 8601 string
+  Size: number; // Size in bytes
 }
 
 // --- 2. XML Parsing Utility ---
 
-/**
- * A basic function to parse XML string response into a usable object structure.
- * This is a highly simplified version using DOMParser. 
- * For robust S3 compliance, consider a library like 'fast-xml-parser'.
- */
 const parseS3Xml = (xmlString: string) => {
-    const parser = new DOMParser();
-    const xmlDoc = parser.parseFromString(xmlString, "application/xml");
-    
-    // Check for an S3 Error response (e.g., AppError in Rust)
-    if (xmlDoc.getElementsByTagName("Error").length > 0) {
-        const code = xmlDoc.getElementsByTagName("Code")[0]?.textContent || "Unknown";
-        const message = xmlDoc.getElementsByTagName("Message")[0]?.textContent || "An unknown S3 error occurred.";
-        const status = xmlDoc.getElementsByTagName("Status")[0]?.textContent || "500";
-        // Throw an error that includes the server-provided message
-        throw new Error(`S3 XML Error (${status} - ${code}): ${message}`);
-    }
+  const parser = new DOMParser();
+  const xmlDoc = parser.parseFromString(xmlString, "application/xml");
 
-    // Parse ListAllMyBucketsResult (GET /buckets)
-    if (xmlDoc.getElementsByTagName("ListAllMyBucketsResult").length > 0) {
-        const bucketNodes = xmlDoc.getElementsByTagName("Bucket");
-        const buckets: S3Bucket[] = Array.from(bucketNodes).map(node => ({
-            Name: node.getElementsByTagName("Name")[0]?.textContent || "unknown",
-            CreationDate: node.getElementsByTagName("CreationDate")[0]?.textContent || new Date().toISOString(),
-        }));
-        return buckets;
-    }
+  // Check for S3 Error response
+  if (xmlDoc.getElementsByTagName("Error").length > 0) {
+    const code = xmlDoc.getElementsByTagName("Code")[0]?.textContent || "Unknown";
+    const message = xmlDoc.getElementsByTagName("Message")[0]?.textContent || "An unknown S3 error occurred.";
+    const status = xmlDoc.getElementsByTagName("Status")[0]?.textContent || "500";
+    throw new Error(`S3 XML Error (${status} - ${code}): ${message}`);
+  }
 
-    // Parse ListBucketResult (GET /{bucket})
-    if (xmlDoc.getElementsByTagName("ListBucketResult").length > 0) {
-        const objectNodes = xmlDoc.getElementsByTagName("Contents");
-        // Note: S3 ListObjects can return 'CommonPrefixes' for folders, but your Rust code only returns 'Contents' (files).
-        const objects: S3Object[] = Array.from(objectNodes).map(node => ({
-            Key: node.getElementsByTagName("Key")[0]?.textContent || "unknown",
-            LastModified: node.getElementsByTagName("LastModified")[0]?.textContent || new Date().toISOString(),
-            Size: parseInt(node.getElementsByTagName("Size")[0]?.textContent || "0", 10),
-        }));
-        return objects;
-    }
-    
-    // Default success response for PUT/DELETE operations
-    return { success: true };
+  // Parse ListAllMyBucketsResult
+  if (xmlDoc.getElementsByTagName("ListAllMyBucketsResult").length > 0) {
+    const bucketNodes = xmlDoc.getElementsByTagName("Bucket");
+    const buckets: S3Bucket[] = Array.from(bucketNodes).map(node => ({
+      Name: node.getElementsByTagName("Name")[0]?.textContent || "unknown",
+      CreationDate: node.getElementsByTagName("CreationDate")[0]?.textContent || new Date().toISOString(),
+    }));
+    return buckets;
+  }
+
+  // Parse ListBucketResult
+  if (xmlDoc.getElementsByTagName("ListBucketResult").length > 0) {
+    const objectNodes = xmlDoc.getElementsByTagName("Contents");
+    const objects: S3Object[] = Array.from(objectNodes).map(node => ({
+      Key: node.getElementsByTagName("Key")[0]?.textContent || "unknown",
+      LastModified: node.getElementsByTagName("LastModified")[0]?.textContent || new Date().toISOString(),
+      Size: parseInt(node.getElementsByTagName("Size")[0]?.textContent || "0", 10),
+    }));
+    return objects;
+  }
+
+  return { success: true };
 };
 
-
-// --- 3. Base Configuration and Axios Instance ---
+// --- 3. Base Configuration and Axios Instances ---
 
 const API_URL_ROOT = import.meta.env.VITE_API_URL;
-if (!API_URL_ROOT) throw new Error("❌ VITE_API_URL is not defined in .env");
+if (!API_URL_ROOT) throw new Error("VITE_API_URL is not defined in .env");
 
-// ✅ Correct BASE_URL to include the /api/v1 prefix used by the Rust server
-const BASE_URL = `${API_URL_ROOT}/api/v1`; 
+const BASE_URL = `${API_URL_ROOT}/api/v1`;
 
-const s3Api = axios.create({
-    baseURL: BASE_URL,
+// 1. Login API — NO JWT interceptor
+const loginApi = axios.create({
+  baseURL: BASE_URL,
+  headers: { Accept: "application/xml" },
 });
 
-// --- 4. S3 Operation Functions ---
+// 2. S3 API — WITH JWT interceptor
+export const s3Api = axios.create({
+  baseURL: BASE_URL,
+});
 
-/**
- * GET /api/v1/buckets -> List all buckets (Returns XML)
- */
+// Add JWT to all S3 API requests (except login)
+s3Api.interceptors.request.use((config) => {
+  const token = localStorage.getItem("authToken");
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
+// Global 401/403 handler
+s3Api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401 || error.response?.status === 403) {
+      localStorage.removeItem("authToken");
+      window.location.href = "/login";
+    }
+    return Promise.reject(error);
+  }
+);
+
+// --- 4. LOGIN FUNCTION (FIXED) ---
+export async function login(username: string, password: string): Promise<string> {
+  const authHeader = `Basic ${btoa(`${username}:${password}`)}`;
+
+  const response = await loginApi.post(
+    "/login",
+    null, // No body
+    {
+      headers: {
+        Authorization: authHeader,
+      },
+      responseType: "text",
+    }
+  );
+
+  // Parse XML: <AuthResponseXml><Token>jwt...</Token></AuthResponseXml>
+  const parser = new DOMParser();
+  const xmlDoc = parser.parseFromString(response.data, "application/xml");
+  const tokenElement = xmlDoc.getElementsByTagName("Token")[0];
+  const token = tokenElement?.textContent;
+
+  if (!token) {
+    throw new Error("Login failed: no token in response");
+  }
+
+  localStorage.setItem("authToken", token);
+  return token;
+}
+
+// --- 5. S3 Operation Functions (unchanged) ---
+
 export async function listBuckets(): Promise<S3Bucket[]> {
-    const response: AxiosResponse<string> = await s3Api.get(`/buckets`, {
-        responseType: 'text', 
-    });
-    return parseS3Xml(response.data) as S3Bucket[];
+  const response: AxiosResponse<string> = await s3Api.get(`/buckets`, {
+    responseType: 'text',
+  });
+  return parseS3Xml(response.data) as S3Bucket[];
 }
 
-/**
- * PUT /api/v1/bucket/{bucket} -> Create a bucket (Expects 200 OK)
- */
-export async function createBucket(bucketName: string): Promise<void> {
-    await s3Api.put(`/bucket/${bucketName}`); 
+// export async function createBucket(bucketName: string): Promise<void> {
+//   await s3Api.put(`/bucket/${bucketName}`);
+// }
+
+export async function createBucket(bucketName: string, subpath?: string): Promise<void> {
+  const url = subpath
+    ? `/bucket/${bucketName}/${subpath}`
+    : `/bucket/${bucketName}`;
+
+  await s3Api.put(url);
 }
 
-/**
- * DELETE /api/v1/bucket/{bucket} -> Delete an empty bucket (Expects 204 No Content)
- */
+
 export async function deleteBucket(bucketName: string): Promise<void> {
-    await s3Api.delete(`/bucket/${bucketName}`);
+  await s3Api.delete(`/bucket/${bucketName}`);
 }
 
-
-/**
- * GET /api/v1/bucket/{bucket} -> List objects in a bucket (Returns XML)
- */
 export async function listObjects(bucketName: string): Promise<S3Object[]> {
-    const response: AxiosResponse<string> = await s3Api.get(`/bucket/${bucketName}`, {
-        responseType: 'text', 
-    });
-    return parseS3Xml(response.data) as S3Object[];
+  const response: AxiosResponse<string> = await s3Api.get(`/bucket/${bucketName}`, {
+    responseType: 'text',
+  });
+  return parseS3Xml(response.data) as S3Object[];
 }
 
-/**
- * PUT /api/v1/bucket/{bucket}/{key} -> Upload an object
- */
 export async function putObject(bucketName: string, key: string, file: File): Promise<void> {
-    // Send the raw File object as the body
-    await s3Api.put(`/bucket/${bucketName}/${key}`, file, {
-        headers: {
-            // Set content type based on the file type
-            "Content-Type": file.type || "application/octet-stream", 
-            "Content-Length": file.size.toString(),
-        },
-    });
+  await s3Api.put(`/object/${bucketName}/${key}`, file, {
+    headers: {
+      "Content-Type": file.type || "application/octet-stream"
+    },
+  });
 }
 
-/**
- * DELETE /api/v1/bucket/{bucket}/{key} -> Delete an object (Expects 204 No Content)
- */
 export async function deleteObject(bucketName: string, key: string): Promise<void> {
-    await s3Api.delete(`/bucket/${bucketName}/${key}`);
+  await s3Api.delete(`/object/${bucketName}/${key}`);
+}
+
+export function getObjectUrl(bucketName: string, key: string): string {
+  return `${BASE_URL}/object/${bucketName}/${key}`;
+}
+
+
+// ──────────────────────────────────────────────────────────────────────
+// 6. Bucket Metadata (XML)
+// ──────────────────────────────────────────────────────────────────────
+
+export interface BucketMetadata {
+  quota_bytes: number;
+  used_bytes: number;
+  object_count: number;
+  versioning: boolean;
+  created_at: string;
+  owner: string;
+  policy: string | null;
+  encryption: string;
+  permission: string; // "ReadWrite" | "ReadOnly" | "None"
 }
 
 /**
- * GET /api/v1/bucket/{bucket}/{key} -> Generate object URL for direct download
+ * GET /api/v1/bucket/{bucket}/metadata
+ * Returns the bucket‑metadata XML parsed into a typed object.
  */
-export function getObjectUrl(bucketName: string, key: string): string {
-    return `${BASE_URL}/bucket/${bucketName}/${key}`;
+export async function getBucketMetadata(bucketName: string): Promise<BucketMetadata> {
+  const response: AxiosResponse<string> = await s3Api.get(
+    `/bucket/${bucketName}/metadata`,
+    {
+      responseType: "text",
+      headers: { Accept: "application/xml" },
+    }
+  );
+
+  const xmlString = response.data;
+  const parser = new DOMParser();
+  const xmlDoc = parser.parseFromString(xmlString, "application/xml");
+
+  // ---- S3‑style error handling (re‑use the same pattern as parseS3Xml) ----
+  if (xmlDoc.getElementsByTagName("Error").length > 0) {
+    const code = xmlDoc.getElementsByTagName("Code")[0]?.textContent || "Unknown";
+    const message =
+      xmlDoc.getElementsByTagName("Message")[0]?.textContent || "Unknown error";
+    throw new Error(`S3 Metadata Error: ${code} - ${message}`);
+  }
+
+  const getText = (tag: string) => {
+    const el = xmlDoc.getElementsByTagName(tag)[0];
+    return el?.textContent?.trim() ?? "";
+  };
+
+  const policyText = getText("Policy");
+  const policyValue = policyText === "null" || policyText === "" ? null : policyText;
+
+  return {
+    quota_bytes: Number.parseInt(getText("QuotaBytes")) || 0,
+    used_bytes: Number.parseInt(getText("UsedBytes")) || 0,
+    object_count: Number.parseInt(getText("ObjectCount")) || 0,
+    versioning: getText("Versioning") === "true",
+    created_at: getText("CreatedAt"),
+    owner: getText("Owner"),
+    policy: policyValue,
+    encryption: getText("Encryption"),
+    permission: getText("Permission") || "None",
+  };
 }
+
