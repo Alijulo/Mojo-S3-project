@@ -65,6 +65,7 @@ once_cell = "1.21.3"
 nix = { version = "0.30.1", optional = true } # optional readahead
 async-stream = "0.3.6"
 bytes  = "1.11.0"
+hmac = "0.12.1"
 
 
 # Explicitly enable it for Unix targets

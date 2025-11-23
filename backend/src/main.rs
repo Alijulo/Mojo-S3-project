@@ -35,7 +35,7 @@ use s3_operations::bucket_handlers::{
     put_bucket_with_subpath,
 };
 use s3_operations::object_handlers::{
-    delete_object, get_object, head_object, list_objects, put_object,
+    delete_object, get_object, head_object, list_objects, put_object,presign_object
 };
 use s3_operations::handler_utils::{S3Headers};
 use s3_operations::auth::auth_middleware;
@@ -137,6 +137,8 @@ pub struct AuthResponseXml {
     #[serde(rename = "UserId")]
     pub user_id: i64,
 }
+
+
 
 // --- Authentication Handler ---
 async fn login_handler(
@@ -286,6 +288,10 @@ async fn main() -> Result<()> {
                 .put(put_object)
                 .delete(delete_object)
                 .head(head_object),
+        )
+        .route(
+        "/api/v1/object/{bucket}/{key}/presign",
+        get(presign_object),
         )
         .layer(body_limit)
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))

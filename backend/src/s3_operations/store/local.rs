@@ -6,7 +6,7 @@ use bytes::Bytes;
 use futures_core::Stream;
 use futures_util::StreamExt;
 use std::{path::PathBuf, pin::Pin};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter, BufReader};
 
 pub struct LocalStore {
     root: PathBuf,
@@ -60,6 +60,39 @@ impl ObjectStore for LocalStore {
         Ok(())
     }
 
+    // async fn get_stream(
+    //     &self,
+    //     bucket: &str,
+    //     key: &str,
+    //     _opts: GetOptions,
+    // ) -> Result<GetResult> {
+    //     let path = self.object_path(bucket, key);
+    //     let mut file = tokio::fs::File::open(&path)
+    //         .await
+    //         .context("Object not found")?;
+    //     let meta = file.metadata().await?;
+    //     let total = meta.len();
+    //             // Wrap in BufReader for consistent async reads
+    //     let mut reader = BufReader::new(file);
+    //     let stream = async_stream::try_stream! {
+    //         const CHUNK: usize = 4 * 1024 * 1024;
+    //         let mut buf = vec![0u8; CHUNK];
+    //         loop {
+    //             let n = reader.read(&mut buf).await?;
+    //             if n == 0 { break; }
+    //             yield Bytes::copy_from_slice(&buf[..n]);
+    //         }
+    //     };
+
+    //     Ok(GetResult {
+    //         content_length: total,
+    //         content_type: "application/octet-stream".to_string(),
+    //         etag: format!("\"{}-{}\"", bucket, key), // simple deterministic etag
+    //         version_id: None,
+    //         body: Box::pin(stream),
+    //     })
+    // }
+
     async fn get_stream(
         &self,
         bucket: &str,
@@ -67,7 +100,7 @@ impl ObjectStore for LocalStore {
         _opts: GetOptions,
     ) -> Result<GetResult> {
         let path = self.object_path(bucket, key);
-        let mut file = tokio::fs::File::open(&path)
+        let file = tokio::fs::File::open(&path)
             .await
             .context("Object not found")?;
         let meta = file.metadata().await?;
@@ -75,10 +108,13 @@ impl ObjectStore for LocalStore {
 
         let stream = async_stream::try_stream! {
             const CHUNK: usize = 4 * 1024 * 1024;
+            let mut reader = BufReader::new(file);
             let mut buf = vec![0u8; CHUNK];
             loop {
-                let n = file.read(&mut buf).await?;
-                if n == 0 { break; }
+                let n = reader.read(&mut buf).await?;
+                if n == 0 {
+                    break; // EOF
+                }
                 yield Bytes::copy_from_slice(&buf[..n]);
             }
         };
@@ -86,7 +122,7 @@ impl ObjectStore for LocalStore {
         Ok(GetResult {
             content_length: total,
             content_type: "application/octet-stream".to_string(),
-            etag: format!("\"{}-{}\"", bucket, key), // simple deterministic etag
+            etag: format!("\"{}-{}\"", bucket, key),
             version_id: None,
             body: Box::pin(stream),
         })

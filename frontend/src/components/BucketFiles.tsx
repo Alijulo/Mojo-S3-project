@@ -1,7 +1,7 @@
 import { useEffect, useState, useRef } from "react";
 import { useParams } from "react-router-dom";
 import { isAxiosError } from "axios";
-import { listObjects, putObject, deleteObject, getObjectUrl, S3Object } from "../api";
+import { listObjects, putObject, deleteObject, downloadObject, S3Object } from "../api";
 
 export default function BucketFiles() {
   const { bucket } = useParams<{ bucket: string }>();
@@ -11,7 +11,7 @@ export default function BucketFiles() {
   const [message, setMessage] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // --- 1. Load Files (GET /api/v1/bucket/{bucket}) ---
+  // --- 1. Load Files ---
   const loadFiles = async () => {
     if (!bucket) return;
     setMessage((prev) => (prev.startsWith("❌") ? "" : prev));
@@ -33,7 +33,7 @@ export default function BucketFiles() {
     setSelectedFile(e.target.files ? e.target.files[0] : null);
   };
 
-  // --- 2. Upload File (PUT /api/v1/bucket/{bucket}/{key}) ---
+  // --- 2. Upload File ---
   const handleUpload = async (e: React.MouseEvent<HTMLButtonElement>) => {
     e.preventDefault();
     if (!selectedFile || !bucket) return;
@@ -63,7 +63,7 @@ export default function BucketFiles() {
     }
   };
 
-  // --- 3. Delete File (DELETE /api/v1/bucket/{bucket}/{key}) ---
+  // --- 3. Delete File ---
   const handleDeleteFile = async (key: string) => {
     if (!bucket) return;
     if (!window.confirm(`Delete file "${key}"? This cannot be undone.`)) return;
@@ -81,6 +81,36 @@ export default function BucketFiles() {
         errorMessage = `❌ Delete failed (${err.response.status}): ${err.response.data || "Server error"}`;
       }
       setMessage(errorMessage);
+    }
+  };
+
+  // --- 4. View File (open in new tab) ---
+  const handleViewFile = async (file: S3Object) => {
+    if (!bucket) return;
+    try {
+      const blob = await downloadObject(bucket, file.Key);
+      const url = URL.createObjectURL(blob);
+      window.open(url, "_blank"); // open in new tab
+    } catch (err) {
+      console.error("View failed:", err);
+      setMessage("❌ Could not open file.");
+    }
+  };
+
+  // --- 5. Download File (save to disk) ---
+  const handleDownloadFile = async (file: S3Object) => {
+    if (!bucket) return;
+    try {
+      const blob = await downloadObject(bucket, file.Key);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = file.Key; // suggest filename
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error("Download failed:", err);
+      setMessage("❌ Download failed.");
     }
   };
 
@@ -121,26 +151,33 @@ export default function BucketFiles() {
           <ul className="divide-y divide-gray-200">
             {files.map((file) => (
               <li key={file.Key} className="flex justify-between items-center py-3">
-                <div>
-                  <a
-                    href={getObjectUrl(bucket!, file.Key)}
-                    className="text-indigo-600 hover:underline font-medium"
-                    target="_blank"
-                    rel="noreferrer"
+                <div className="flex items-center space-x-4">
+                  <span className="text-indigo-600 font-medium">{file.Key}</span>
+                  <button
+                    onClick={() => handleViewFile(file)}
+                    className="text-blue-600 hover:text-blue-800 text-sm font-medium transition"
                   >
-                    {file.Key}
-                  </a>
-                  <p className="text-gray-500 text-xs mt-0.5">
+                    View
+                  </button>
+                  <button
+                    onClick={() => handleDownloadFile(file)}
+                    className="text-green-600 hover:text-green-800 text-sm font-medium transition"
+                  >
+                    Download
+                  </button>
+                </div>
+                <div className="text-right">
+                  <p className="text-gray-500 text-xs">
                     Size: {(file.Size / 1024).toFixed(2)} KB | Modified:{" "}
                     {new Date(file.LastModified).toLocaleDateString()}
                   </p>
+                  <button
+                    onClick={() => handleDeleteFile(file.Key)}
+                    className="text-red-600 hover:text-red-800 text-sm font-medium transition mt-1"
+                  >
+                    Delete
+                  </button>
                 </div>
-                <button
-                  onClick={() => handleDeleteFile(file.Key)}
-                  className="text-red-600 hover:text-red-800 text-sm font-medium transition"
-                >
-                  Delete
-                </button>
               </li>
             ))}
           </ul>

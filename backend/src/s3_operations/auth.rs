@@ -20,7 +20,9 @@ use crate::{
     s3_operations::{handler_utils::AppError,metadata::{get},bucket_handlers::evaluate_bucket_policy},
 };
 use std::{path::PathBuf};
-
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+use base64::{engine::general_purpose, Engine as _};
 // Constants for authentication prefixes
 const BEARER_PREFIX: &str = "Bearer ";
 const BASIC_PREFIX: &str = "Basic ";
@@ -449,6 +451,29 @@ pub async fn check_bucket_permission(
     Ok(acl_result)
 }
 
+
+
+type HmacSha256 = Hmac<Sha256>;
+
+pub fn generate_presigned_url(
+    bucket: &str,
+    key: &str,
+    secret: &str,
+    expiry_secs: i64,
+) -> String {
+    let expires = Utc::now() + Duration::seconds(expiry_secs);
+    let expiry_ts = expires.timestamp();
+
+    let data = format!("{bucket}/{key}:{expiry_ts}");
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(data.as_bytes());
+    let signature = mac.finalize().into_bytes();
+    let sig_b64 = general_purpose::URL_SAFE_NO_PAD.encode(signature);
+
+    format!(
+        "/api/v1/object/{bucket}/{key}?expires={expiry_ts}&sig={sig_b64}"
+    )
+}
 
 
 pub fn invalidate_auth_cache(username: &str) {

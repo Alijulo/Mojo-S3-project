@@ -18,7 +18,7 @@ use hex;
 use tracing::info;
 use uuid::Uuid;
 use crate::{
-    s3_operations::{handler_utils::{AppError,ObjectInfo, CommonPrefix}, auth::{check_bucket_permission, AuthenticatedUser, PermissionLevel},metadata::{get, set},bucket_handlers::BucketMeta},
+    s3_operations::{handler_utils::{AppError,ObjectInfo, CommonPrefix}, auth::{check_bucket_permission, AuthenticatedUser, PermissionLevel,generate_presigned_url},metadata::{get, set},bucket_handlers::BucketMeta},
     AppState,S3_XMLNS, S3Headers,GLOBAL_IO_SEMAPHORE,
 };
 use base64::Engine;
@@ -626,12 +626,32 @@ pub async fn get_object(
     info!("GET {}/{}?{:?}", bucket, key, params);
 
     // 1. Permission
-    if !check_bucket_permission(&state.pool, &user.0, &bucket, PermissionLevel::ReadOnly.as_str())
-        .await
-        .map_err(AppError::Internal)?
-    {
+    // if !check_bucket_permission(&state.pool, &user.0, &bucket, PermissionLevel::ReadOnly.as_str())
+    //     .await
+    //     .map_err(AppError::Internal)?
+    // {
+    //     return Err(AppError::AccessDenied);
+    // }
+
+    let can_read = check_bucket_permission(
+        &state.pool,
+        &user.0,
+        &bucket,
+        PermissionLevel::ReadOnly.as_str()
+    ).await?;
+
+    let can_rw = check_bucket_permission(
+        &state.pool,
+        &user.0,
+        &bucket,
+        PermissionLevel::ReadWrite.as_str()
+    ).await?;
+
+    if !can_read && !can_rw {
         return Err(AppError::AccessDenied);
     }
+
+
 
     // 2. Paths
     let bucket_path = state.bucket_path(&bucket);
@@ -786,32 +806,40 @@ pub async fn get_object(
     }
 
     // 14. 32/64-bit safe streaming via ReaderStream.take(limit)
-    const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
-    let chunk_size_u64 = CHUNK_SIZE as u64;
-    let num_chunks_u64 = if content_length == 0 {
-        0
-    } else {
-        (content_length + chunk_size_u64 - 1) / chunk_size_u64
-    };
 
-    let (body, response_content_length): (Body, u64) = if mem::size_of::<usize>() == 8 {
-        // 64-bit
-        let stream = ReaderStream::with_capacity(file, CHUNK_SIZE).take(num_chunks_u64 as usize);
-        (Body::from_stream(stream), content_length)
-    } else {
-        // 32-bit
-        const MAX_32BIT_SAFE: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB guidance
-        if content_length > MAX_32BIT_SAFE {
-            let stream = ReaderStream::with_capacity(file, CHUNK_SIZE);
-            (Body::from_stream(stream), content_length)
-        } else {
-            let limit: usize = num_chunks_u64
-                .try_into()
-                .map_err(|_| AppError::Internal(anyhow::anyhow!("Chunk count exceeds usize::MAX on 32-bit")))?;
-            let stream = ReaderStream::with_capacity(file, CHUNK_SIZE).take(limit);
-            (Body::from_stream(stream), content_length)
-        }
-    };
+    // const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
+    // let chunk_size_u64 = CHUNK_SIZE as u64;
+    // let num_chunks_u64 = if content_length == 0 {
+    //     0
+    // } else {
+    //     (content_length + chunk_size_u64 - 1) / chunk_size_u64
+    // };
+
+    // let (body, response_content_length): (Body, u64) = if mem::size_of::<usize>() == 8 {
+    //     // 64-bit
+    //     let stream = ReaderStream::with_capacity(file, CHUNK_SIZE).take(num_chunks_u64 as usize);
+    //     (Body::from_stream(stream), content_length)
+    // } else {
+    //     // 32-bit
+    //     const MAX_32BIT_SAFE: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB guidance
+    //     if content_length > MAX_32BIT_SAFE {
+    //         let stream = ReaderStream::with_capacity(file, CHUNK_SIZE);
+    //         (Body::from_stream(stream), content_length)
+    //     } else {
+    //         let limit: usize = num_chunks_u64
+    //             .try_into()
+    //             .map_err(|_| AppError::Internal(anyhow::anyhow!("Chunk count exceeds usize::MAX on 32-bit")))?;
+    //         let stream = ReaderStream::with_capacity(file, CHUNK_SIZE).take(limit);
+    //         (Body::from_stream(stream), content_length)
+    //     }
+    // };
+
+    const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
+    let stream = ReaderStream::with_capacity(file, CHUNK_SIZE);
+    // Stream until EOF; match Content-Length with actual bytes that will be sent.
+    let body = Body::from_stream(stream);
+    let response_content_length = content_length;
+
 
     // 15. Headers
     let mut resp_headers = S3Headers::common_headers();
@@ -895,7 +923,30 @@ async fn try_sendfile(
 }
 
 
+//Presign_object  Generate presigned URL
+pub async fn presign_object(
+    State(state): State<Arc<AppState>>,
+    AxumPath((bucket, key)): AxumPath<(String, String)>,
+    user: Extension<AuthenticatedUser>,
+) -> Result<impl IntoResponse, AppError> {
+    // Permission check
+    let allowed = check_bucket_permission(
+        &state.pool,
+        &user.0,
+        &bucket,
+        PermissionLevel::ReadOnly.as_str()
+    ).await?;
+    if !allowed {
+        return Err(AppError::AccessDenied);
+    }
 
+    // Generate presigned URL
+    let secret = std::env::var("PRESIGN_SECRET")
+        .unwrap_or_else(|_| "default-secret".into());
+    let url = generate_presigned_url(&bucket, &key, &secret, 300); // 5 min expiry
+
+    Ok((StatusCode::OK, url))
+}
 
 
 

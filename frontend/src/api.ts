@@ -178,6 +178,13 @@ export function getObjectUrl(bucketName: string, key: string): string {
   return `${BASE_URL}/object/${bucketName}/${key}`;
 }
 
+export async function downloadObject(bucketName: string, key: string): Promise<Blob> {
+  const response = await s3Api.get(`/object/${bucketName}/${key}`, {
+    responseType: "blob", // important: get raw binary
+  });
+  return response.data;
+}
+
 
 // ──────────────────────────────────────────────────────────────────────
 // 6. Bucket Metadata (XML)

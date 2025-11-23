@@ -23,6 +23,7 @@ dependencies = [
  "futures-util",
  "headers",
  "hex",
+ "hmac",
  "http",
  "http-range",
  "httpdate",
