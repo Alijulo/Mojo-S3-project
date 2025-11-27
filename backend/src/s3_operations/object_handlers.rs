@@ -1,17 +1,17 @@
 use axum::{
-    extract::{Path as AxumPath, State, Query},
+    extract::{Path as AxumPath, State, Query,},
     response::{Response, IntoResponse},
     body::Body,
     http::{StatusCode, header, HeaderMap,HeaderValue},
     extract::Request,Extension
 };
 use std::{path::{Path, PathBuf},mem};
-use tokio::{fs::{File, self}, sync::{Semaphore, Mutex}, io::{AsyncWriteExt,AsyncReadExt, AsyncSeekExt, BufWriter}};
+use tokio::{fs::{File, self}, sync::{Semaphore, Mutex}, io::{AsyncWriteExt,AsyncReadExt,AsyncWrite, AsyncSeekExt, AsyncRead,BufWriter}};
 use tokio_util::io::ReaderStream;
 use std::io;
 use futures_util::StreamExt;
 use std::collections::VecDeque;
-use anyhow::Context;
+use anyhow::{anyhow,Context};
 use chrono::{DateTime, Utc};
 use md5;
 use hex;
@@ -19,21 +19,24 @@ use tracing::info;
 use uuid::Uuid;
 use crate::{
     s3_operations::{handler_utils::{AppError,ObjectInfo, CommonPrefix}, auth::{check_bucket_permission, AuthenticatedUser, PermissionLevel,generate_presigned_url},metadata::{get, set},bucket_handlers::BucketMeta},
-    AppState,S3_XMLNS, S3Headers,GLOBAL_IO_SEMAPHORE,
+    AppState,S3_XMLNS, S3Headers,GLOBAL_IO_SEMAPHORE,DurabilityLevel, index::BucketIndex,
+    index::types::{GetResult,IndexEntry},
 };
 use base64::Engine;
 use serde::{Serialize, Deserialize,};
 use http_range::HttpRange;
 use httpdate::fmt_http_date;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering,AtomicBool};
 use md5::Context as Md5Context;
+use http_body_util::BodyStream;
+
 
 use once_cell::sync::Lazy;
-use bytes::Bytes;
+use axum::body::Bytes; 
 use std::{io::ErrorKind, time::{SystemTime,Instant}, collections::{HashSet,HashMap}, sync::Arc,convert::TryInto};
 use sha2::{Digest, Sha256};
 use base64::engine::general_purpose::STANDARD as BASE64;
-
+use pin_project::pin_project;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
@@ -112,7 +115,7 @@ struct DeleteMarkerEntry {
 static PUT_BYTES: AtomicU64 = AtomicU64::new(0);
 static PUT_COUNT: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize,Clone, Default)]
 pub struct ObjectMeta {
     #[serde(default)]
     etag: String,
@@ -160,39 +163,68 @@ pub async fn load_object_meta(parent: &Path, safe_key: &str) -> Result<ObjectMet
             .ok_or(AppError::NoSuchKey)
 }
 
-//Indexing
-#[derive(Debug, Serialize, Deserialize)]
-struct IndexEntry {
-    key: String,
-    last_modified: String,
-    size: u64,
-    etag: String,
+/// Write object metadata sidecar via xattr, ensuring file exists and fsync on Unix
+pub async fn save_object_meta(
+    marker: &Path,
+    obj_meta: &ObjectMeta,
+    durability: bool,
+) -> Result<(), AppError> {
+    let obj_json = serde_json::to_string_pretty(obj_meta)
+        .map_err(|e| AppError::Internal(e.into()))?;
+
+    #[cfg(unix)]
+    {
+        if fs::metadata(marker).await.is_err() {
+            let _ = fs::File::create(marker).await;
+        }
+    }
+
+    set(marker, "user.s3.meta", obj_json.as_bytes())
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("set obj meta: {e}")))?;
+
+    if durability {
+        if let Some(parent) = marker.parent() {
+            fsync_dir(parent).await;
+        }
+    }
+    Ok(())
 }
 
+pub async fn load_bucket_meta(bucket_path: &Path) -> Result<BucketMeta, AppError> {
+    let marker = bucket_path.join(".s3meta");
+    let data = get(&marker, "user.s3.meta").await.ok().flatten();
+    let json = data.and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_else(|| r#"{"versioning":false,"object_count":0,"used_bytes":0}"#.to_string());
+    serde_json::from_str(&json).map_err(|e| AppError::Internal(e.into()))
+}
 
-// async fn load_index(bucket_root: &Path, prefix: &str) -> io::Result<Vec<IndexEntry>> {
-//     let idx_path = bucket_root.join(".s3index").join(prefix);
-//     match get(&idx_path, "s3.index").await {
-//         Ok(Some(data)) => {
-//             let entries: Vec<IndexEntry> = serde_json::from_slice(&data)?;
-//             Ok(entries)
-//         }
-//         Ok(None) => Ok(Vec::new()),
-//         Err(e) => Err(e),
-//     }
-// }
+pub async fn save_bucket_meta(
+    bucket_path: &Path,
+    bucket_meta: &BucketMeta,
+    durability: bool,
+) -> Result<(), AppError> {
+    let marker = bucket_path.join(".s3meta");
+    let json = serde_json::to_string_pretty(bucket_meta)
+        .map_err(|e| AppError::Internal(e.into()))?;
 
+    #[cfg(unix)]
+    {
+        if fs::metadata(&marker).await.is_err() {
+            let _ = fs::File::create(&marker).await;
+        }
+    }
 
+    set(&marker, "user.s3.meta", json.as_bytes())
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("set bucket meta: {e}")))?;
 
+    if durability {
+        fsync_dir(bucket_path).await;
+    }
+    Ok(())
+}
 
-
-// async fn save_index(bucket_root: &Path, prefix: &str, entries: &[IndexEntry]) -> io::Result<()> {
-//     let idx_dir = bucket_root.join(".s3index");
-//     fs::create_dir_all(&idx_dir).await?;
-//     let idx_path = idx_dir.join(prefix);
-//     let data = serde_json::to_vec(entries)?;
-//     set(&idx_path, "s3.index", &data).await
-// }
 
 
 // URL-safe base64 token helpers (encode last returned key)
@@ -221,19 +253,465 @@ fn parse_tagging(s: &str) -> std::collections::HashMap<String, String> {
 }
 
 
+
+
+// Ensure helper exists in this module
+#[cfg(unix)]
+async fn ensure_file_exists(path: &Path) {
+    if fs::metadata(path).await.is_err() {
+        let _ = fs::File::create(path).await;
+    }
+}
+
+
+
+// Validation helpers
+fn validate_bucket(bucket: &str) -> Result<(), AppError> {
+    let len = bucket.len();
+    if len < 3 || len > 63 {
+        return Err(AppError::InvalidBucketName("Invalid bucket length".into()));
+    }
+    if !bucket.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-') {
+        return Err(AppError::InvalidBucketName("Invalid bucket characters".into()));
+    }
+    if bucket.starts_with('.') || bucket.ends_with('.') || bucket.contains("..") {
+        return Err(AppError::InvalidBucketName("Invalid bucket dots".into()));
+    }
+    if bucket.split('.').all(|p| p.parse::<u8>().is_ok()) {
+        return Err(AppError::InvalidBucketName("Bucket must not be formatted like an IP address".into()));
+    }
+    Ok(())
+}
+
+fn validate_key(key: &str) -> Result<(), AppError> {
+    if key.is_empty() {
+        return Err(AppError::BadRequest("Empty object key".into()));
+    }
+    if key.contains("..") || key.starts_with('/') || key.contains('\\') {
+        return Err(AppError::BadRequest("Invalid object key path".into()));
+    }
+    if key.chars().any(|c| c.is_control()) {
+        return Err(AppError::BadRequest("Invalid object key control characters".into()));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultipartUploadMarker {
+    pub key: String,
+    pub owner: String,
+    pub upload_id: String,
+    pub initiated: String,
+    pub part_etags: HashMap<u32, String>,
+    pub part_sizes: HashMap<u32, u64>,
+    pub part_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadPartQuery {
+    pub partNumber: u32,
+    pub uploadId: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompleteUploadQuery {
+    pub uploadId: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AbortUploadQuery {
+    pub uploadId: String,
+}
+
+fn s3_now() -> String {
+    DateTime::<Utc>::from(std::time::SystemTime::now())
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+// Adapter that updates checksums while reading
+#[pin_project]
+pub struct ChecksumWriter<W> {
+    #[pin]
+    inner: W,
+    md5: Md5Context,
+    sha256: Sha256,
+    total: u64,
+}
+
+impl<W: AsyncWrite + Unpin> ChecksumWriter<W> {
+    pub fn new(inner: W) -> Self {
+        Self { inner, md5: Md5Context::new(), sha256: Sha256::new(), total: 0 }
+    }
+
+    // Call after all writes; does NOT flush/sync
+    pub fn finalize(self) -> (Vec<u8>, Vec<u8>, u64) {
+        let md5_bytes = self.md5.finalize().0.to_vec();
+        let sha256_bytes = self.sha256.finalize().to_vec();
+        (md5_bytes, sha256_bytes, self.total)
+    }
+
+    // Strong finish for BufWriter<File> that flushes & syncs before returning checksums
+    pub async fn finish(mut self) -> Result<(Vec<u8>, Vec<u8>, u64), AppError>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        // Best-effort flush; sync handled by specialization below if BufWriter<File>
+        self.inner
+            .flush()
+            .await
+            .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+        Ok(self.finalize())
+    }
+}
+
+// Specialization for BufWriter<File>: provide a strict finish that fsyncs the file.
+impl ChecksumWriter<tokio::io::BufWriter<tokio::fs::File>> {
+    pub async fn flush_and_sync(&mut self) -> Result<(), AppError> {
+        self.inner.flush().await.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+        let file_ref: &tokio::fs::File = self.inner.get_ref();
+        file_ref.sync_all().await.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+        Ok(())
+    }
+
+    pub async fn finish_and_sync(mut self) -> Result<(Vec<u8>, Vec<u8>, u64), AppError> {
+        self.flush_and_sync().await?;
+        Ok(self.finalize())
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for ChecksumWriter<W> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        let poll = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = &poll {
+            if *n > 0 {
+                let written = &buf[..*n];
+                self.md5.consume(written);
+                self.sha256.update(written);
+                self.total += *n as u64;
+            }
+        }
+        poll
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        let poll = std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        if let std::task::Poll::Ready(Ok(n)) = &poll {
+            if *n > 0 {
+                let mut remaining = *n;
+                for s in bufs {
+                    let take = remaining.min(s.len());
+                    if take == 0 { break; }
+                    let part = &s[..take];
+                    self.md5.consume(part);
+                    self.sha256.update(part);
+                    remaining -= take;
+                }
+                self.total += *n as u64;
+            }
+        }
+        poll
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        // Prefer flush before shutdown
+        if let std::task::Poll::Ready(Ok(())) =
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        } else {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+}
+
+// Important: Document usage
+// This writer is safe with write_all; raw poll_write callers MUST handle partial writes.
+// Vectored writes are supported and correctly hashed.
+
+//TempGuard
+struct TempGuard {
+    path: PathBuf,
+    committed: AtomicBool,
+}
+
+impl TempGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, committed: AtomicBool::new(false) }
+    }
+
+    fn mark_committed(&self) { self.committed.store(true, Ordering::Release); }
+
+    async fn cleanup_async(&self) {
+        if !self.committed.load(Ordering::Acquire) {
+            let _ = fs::remove_file(&self.path).await;
+        }
+    }
+}
+
+impl Drop for TempGuard {
+    fn drop(&mut self) {
+        if !self.committed.load(Ordering::Acquire) {
+            let path = self.path.clone();
+            // Offload to an OS thread to avoid blocking the async reactor
+            std::thread::spawn(move || {
+                let _ = std::fs::remove_file(path);
+            });
+        }
+    }
+}
+
+
+
+pub trait DurableOps {
+    fn durability_enabled(&self) -> bool;
+}
+
+impl DurableOps for AppState {
+    fn durability_enabled(&self) -> bool {
+        self.durability == DurabilityLevel::Strong
+    }
+}
+
+/// Best-effort fsync on a directory path.
+
+/// Flush buffered writer and fsync its underlying file.
+/// Best-effort fsync on a directory path (portable).
+pub async fn fsync_dir(path: &Path) {
+    #[cfg(unix)]
+    {
+        tokio::task::block_in_place(|| {
+            let res = std::fs::File::open(path)
+                .and_then(|f| {
+                    // On Unix, opening a directory via std works; sync_all persists entry changes.
+                    f.sync_all()
+                });
+            let _ = res;
+        });
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        tokio::task::block_in_place(|| {
+            let res = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(winapi::um::winbase::FILE_FLAG_BACKUP_SEMANTICS)
+                .open(path)
+                .and_then(|f| f.sync_all());
+            let _ = res;
+        });
+    }
+}
+
+/// Flush buffered writer and fsync its underlying file.
+pub async fn flush_and_sync_bufwriter(w: &mut tokio::io::BufWriter<tokio::fs::File>) -> Result<(), AppError> {
+    w.flush().await.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    w.get_ref().sync_all().await.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    Ok(())
+}
+
+/// Atomic rename with optional fsync of both source and destination directories.
+pub async fn atomic_rename(tmp: &Path, final_path: &Path, durability: bool) -> Result<(), AppError> {
+    // Cross-device protection
+    ensure_same_device(tmp, final_path).await?;
+
+    fs::rename(tmp, final_path)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+
+    if durability {
+        if let Some(dst) = final_path.parent() { fsync_dir(dst).await; }
+        if let Some(src) = tmp.parent() { fsync_dir(src).await; }
+    }
+    Ok(())
+}
+
+// Guard against cross-filesystem rename (atomicity breakage).
+async fn ensure_same_device(a: &Path, b: &Path) -> Result<(), AppError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let (ma, mb) = tokio::task::block_in_place(|| {
+            (std::fs::metadata(a), std::fs::metadata(b.parent().unwrap_or(Path::new("."))))
+        });
+        let dev_a = ma.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?.dev();
+        let dev_b = mb.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?.dev();
+        if dev_a != dev_b {
+            return Err(AppError::Internal(anyhow::anyhow!("cross-device rename not allowed")));
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Minimal check: compare volume serial numbers via Win API if desired.
+        // For now: assume objects must reside under the same bucket root; enforce via path prefix.
+        let a_root = a.components().next();
+        let b_root = b.components().next();
+        if a_root != b_root {
+            return Err(AppError::Internal(anyhow::anyhow!("cross-volume rename not allowed")));
+        }
+    }
+    Ok(())
+}
+
+//Incomolete marker
+fn spawn_incomplete_marker(parent: &Path, base_name: &std::ffi::OsStr) {
+    let parent = parent.to_path_buf();
+    let base_name = base_name.to_owned();
+    let _ = tokio::spawn(async move {
+        let marker = parent.join(format!(".incomplete.{}", base_name.to_string_lossy()));
+        let _ = fs::write(&marker, b"post-rename failure").await;
+        fsync_dir(&parent).await;
+    });
+}
+
+
+/// A durable commit that sequences file flush+sync → rename → dir fsyncs → meta → bucket → index.
+/// If any post-rename step fails, writes an "incomplete" marker and returns an error, allowing repair.
+pub async fn commit_object_transaction(
+    state: &AppState,
+    tmp_path: &Path,
+    final_path: &Path,
+    parent_dir: &Path,
+    meta_marker: &Path,
+    obj_meta: &ObjectMeta,
+    bucket_path: &Path,
+    bucket_meta: &BucketMeta,
+    bucket_index: &Arc<BucketIndex>, // <-- change type here
+) -> Result<(), AppError> {
+    // ────────────────────────────────
+    // Step 1: Rename + fsyncs
+    // ────────────────────────────────
+    atomic_rename(tmp_path, final_path, state.durability_enabled()).await?;
+
+    // ────────────────────────────────
+    // Step 2: Write object metadata
+    // ────────────────────────────────
+    save_object_meta(meta_marker, obj_meta, state.durability_enabled()).await
+        .map_err(|e| {
+            let _ = mark_incomplete(final_path, parent_dir);
+            e
+        })?;
+
+    // ────────────────────────────────
+    // Step 3: Bucket meta
+    // ────────────────────────────────
+    save_bucket_meta(bucket_path, bucket_meta, state.durability_enabled()).await
+        .map_err(|e| {
+            let _ = mark_incomplete(final_path, parent_dir);
+            e
+        })?;
+
+    // ────────────────────────────────
+    // Step 4: WAL Index update
+    // ────────────────────────────────
+    // Build entry from obj_meta
+    use chrono::Utc;
+    let last_modified = DateTime::<Utc>::from(std::time::SystemTime::now())
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+    let entry = IndexEntry {
+        key: final_path.file_name().unwrap().to_string_lossy().to_string(),
+        size: bucket_meta.used_bytes, // or obj size if tracked separately
+        etag: obj_meta.etag.clone(),
+        last_modified,
+        seq_no: 0, // assigned inside BucketIndex
+        is_delete: obj_meta.is_delete_marker,
+        version: obj_meta.version_id.clone(),
+    };
+
+    bucket_index.put(entry).await
+        .map_err(|e| {
+            let _ = mark_incomplete(final_path, parent_dir);
+            AppError::Internal(anyhow::anyhow!(format!("index put: {e}")))
+        })?;
+
+    if state.durability_enabled() {
+        if let Err(e) = bucket_index.compact().await {
+            tracing::warn!("index compact failed after commit: {}", e);
+        }
+    }
+
+    Ok(())
+}
+
+
+/// Write a small sidecar marker indicating incomplete state for repair tools.
+fn mark_incomplete(final_path: &Path, parent_dir: &Path) -> Result<(), AppError> {
+    let marker = parent_dir.join(format!(".incomplete.{}", final_path.file_name().unwrap().to_string_lossy()));
+    tokio::task::block_in_place(|| {
+        std::fs::write(&marker, b"post-rename failure").map_err(|e| AppError::Internal(anyhow::anyhow!(e)))
+    })?;
+    // Best-effort dir fsync
+    futures::executor::block_on(fsync_dir(parent_dir));
+    Ok(())
+}
+
+// Safe order: archive old BEFORE writing the new object, and fsync both file and dir.
+async fn archive_previous_version(
+    state: &AppState,
+    base_path: &Path,
+    parent: &Path,
+    safe_key: &str,
+    prev_version_id: &str,
+) -> Result<(), AppError> {
+    let existed = fs::metadata(base_path).await.is_ok();
+    if !existed { return Ok(()); }
+
+    let archive_dir = parent.join(".s3versions").join(safe_key);
+    fs::create_dir_all(&archive_dir).await.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+
+    let archive_path = archive_dir.join(prev_version_id);
+    // Prefer hard link; fallback to copy.
+    if fs::hard_link(base_path, &archive_path).await.is_err() {
+        fs::copy(base_path, &archive_path).await.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    }
+    // Fsync the archived file and the versions directory if strong durability.
+    if state.durability_enabled() {
+        let f = fs::File::open(&archive_path).await.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+        f.sync_all().await.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+        fsync_dir(&archive_dir).await;
+    }
+    Ok(())
+}
+
+
 pub async fn put_object(
     State(state): State<Arc<AppState>>,
     AxumPath((bucket, key)): AxumPath<(String, String)>,
     user: Extension<AuthenticatedUser>,
     req: axum::extract::Request,
 ) -> Result<(StatusCode, HeaderMap), AppError> {
-    PUT_COUNT.fetch_add(1, Ordering::Relaxed);
+    // ────────────────────────────────
+    // SECTION 0: Metrics + Validation
+    // ────────────────────────────────
+    PUT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let start = std::time::Instant::now();
+
+    validate_bucket(&bucket)?;
+    validate_key(&key)?;
 
     let req_id = format!("put-{}-{}", bucket, key);
     tracing::info!(req_id, bucket=%bucket, key=%key, "PUT begin");
 
-    // 1) AuthZ
+    // ────────────────────────────────
+    // SECTION 1: Authorization
+    // ────────────────────────────────
     let allowed = check_bucket_permission(
         &state.pool,
         &user.0,
@@ -246,345 +724,344 @@ pub async fn put_object(
         return Err(AppError::AccessDenied);
     }
 
-    // 2) Concurrency controls
-    let _permit = state.io_budget.acquire().await.unwrap();
-    let lock_key = format!("{bucket}/{key}");
-    let _guard = state.io_locks.lock(lock_key).await;
+    // ────────────────────────────────
+    // SECTION 2: Concurrency Controls
+    // ────────────────────────────────
+    let _permit = state.io_budget.acquire().await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    let _obj_guard = state.io_locks.lock(format!("{bucket}/{key}")).await;
 
-    // 3) Paths
+    // ────────────────────────────────
+    // SECTION 3: Paths + Bucket Meta
+    // ────────────────────────────────
     let base_path = state.object_path(&bucket, &key);
     let bucket_path = state.bucket_path(&bucket);
     if !bucket_path.exists() {
         return Err(AppError::NotFound(bucket));
     }
-    let parent = base_path.parent().unwrap().to_path_buf();
-    fs::create_dir_all(&parent).await.context("create parent").map_err(AppError::Internal)?;
+    let parent = base_path.parent()
+        .ok_or_else(|| AppError::BadRequest("Invalid object path".into()))?
+        .to_path_buf();
+    fs::create_dir_all(&parent).await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
 
-    // 4) Bucket meta
-    let bucket_meta_path = bucket_path.join(".s3meta");
-    let bucket_meta_json = get(&bucket_meta_path, "user.s3.meta")
-        .await
-        .ok()
-        .flatten()
-        .and_then(|b| String::from_utf8(b).ok())
-        .unwrap_or_else(|| r#"{"versioning":false,"object_count":0,"used_bytes":0}"#.to_string());
-    let mut bucket_meta: BucketMeta = serde_json::from_str(&bucket_meta_json)
-        .unwrap_or_else(|_| BucketMeta {
-            versioning: false,
-            object_count: 0,
-            used_bytes: 0,
-            ..Default::default()
-        });
+    let mut bucket_meta = load_bucket_meta(&bucket_path).await?;
     let versioning = bucket_meta.versioning;
 
-    // 5) Object meta sidecar
-    let safe_key = key.replace('/', "_");
-    let meta_marker = parent.join(format!(".s3meta.{safe_key}"));
-    let mut obj_meta: ObjectMeta = get(&meta_marker, "user.s3.meta")
-        .await
-        .ok()
-        .flatten()
-        .and_then(|b| String::from_utf8(b).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| ObjectMeta::new(&user.0.username));
-
-    // 6) Conditional headers
-    if let Some(if_match) = req.headers().get(header::IF_MATCH).and_then(|h| h.to_str().ok()) {
-        let expected = if_match.trim();
-        if !expected.is_empty() && obj_meta.etag != expected {
-            return Err(AppError::PreconditionFailed);
-        }
-    }
-    if let Some(if_none_match) = req.headers().get(header::IF_NONE_MATCH).and_then(|h| h.to_str().ok()) {
-        let forbidden = if_none_match.trim();
-        if !forbidden.is_empty() && obj_meta.etag == forbidden {
-            return Err(AppError::PreconditionFailed);
-        }
-    }
-
-        // 7) Version ID (opaque)
-    let new_version_id = if versioning {
-        Some(Uuid::new_v4().to_string())
+    // ────────────────────────────────
+    // SECTION 4: Safe Key + Object Meta
+    // ────────────────────────────────
+    let safe_key_base = encode_token(&key);
+    let safe_key = if safe_key_base.len() <= 200 {
+        safe_key_base
     } else {
-        None
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(key.as_bytes());
+        format!("sha256-{}", hex::encode(hasher.finalize()))
     };
+    let meta_marker = parent.join(format!(".s3meta.{safe_key}"));
 
-    // Always write to canonical path
-    let final_path = base_path.clone();
+    let mut obj_meta = load_object_meta(&parent, &safe_key)
+        .await
+        .unwrap_or_else(|_| ObjectMeta::new(&user.0.username));
 
-    // 8) Content headers + limits + integrity inputs
-    let content_type = req
-        .headers()
-        .get(header::CONTENT_TYPE)
+    // ────────────────────────────────
+    // SECTION 5: Request Headers
+    // ────────────────────────────────
+    let (parts, body) = req.into_parts();
+    let headers = parts.headers;
+
+    let content_type = headers.get(header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("application/octet-stream")
         .to_string();
 
-    let content_len = req
-        .headers()
-        .get(header::CONTENT_LENGTH)
+    let content_len = headers.get(header::CONTENT_LENGTH)
         .and_then(|h| h.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok());
 
+    let max_bytes = std::env::var("MAX_OBJECT_BYTES")
+        .ok().and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(5 * 1024 * 1024 * 1024); // default 5 GiB
+
     if let Some(len) = content_len {
-        let max_bytes = std::env::var("MAX_OBJECT_BYTES")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(u64::MAX);
         if len > max_bytes {
             return Err(AppError::EntityTooLarge);
         }
     }
 
-    let content_md5_b64 = req
-        .headers()
-        .get("Content-MD5")
-        .and_then(|h| h.to_str().ok())
-        .map(str::to_string);
+    let content_md5_b64 = headers.get("Content-MD5").and_then(|h| h.to_str().ok()).map(str::to_string);
+    let x_amz_sha256_hex = headers.get("x-amz-content-sha256").and_then(|h| h.to_str().ok()).map(str::to_string);
 
-    let x_amz_sha256_hex = req
-        .headers()
-        .get("x-amz-content-sha256")
-        .and_then(|h| h.to_str().ok())
-        .map(str::to_string);
-
+    // ────────────────────────────────
+    // SECTION 6: User Metadata + Tags
+    // ────────────────────────────────
     let mut user_meta = std::collections::HashMap::new();
-    for (name, value) in req.headers().iter() {
+    let mut user_meta_wire_bytes: usize = 0;
+    for (name, value) in headers.iter() {
         if let Some(rest) = name.as_str().strip_prefix("x-amz-meta-") {
             if let Ok(vs) = value.to_str() {
+                user_meta_wire_bytes += "x-amz-meta-".len() + rest.len() + vs.len();
                 user_meta.insert(rest.to_string(), vs.to_string());
             }
         }
     }
+    // AWS S3 hard limit: total metadata size <= 2 KB
+    if user_meta_wire_bytes > 2 * 1024 {
+        return Err(AppError::BadRequest("metadata too large".into()));
+    }
 
-    let tags = req
-        .headers()
-        .get("x-amz-tagging")
+    let tags = headers.get("x-amz-tagging")
         .and_then(|h| h.to_str().ok())
         .map(parse_tagging)
         .unwrap_or_default();
 
-    // Capture old size (for bucket stats adjustment on overwrite)
-    let old_size = match fs::metadata(&final_path).await {
-        Ok(m) => m.len(),
-        Err(_) => 0,
-    };
+    // ────────────────────────────────
+    // SECTION 7: Existence + Conditional Headers
+    // ────────────────────────────────
+    let meta_opt = fs::metadata(&base_path).await.ok();
+    let existed = meta_opt.is_some();
+    let old_size = meta_opt.map(|m| m.len()).unwrap_or(0);
+    let is_new_object = !existed;
 
-    // Determine if this is a new object (S3-style: based on existence)
-    let is_new_object = old_size == 0;
+    let object_exists = existed;
+    let current_etag_unquoted = obj_meta.etag.trim().trim_matches('"');
 
-    // 9) Temp write with buffered IO, prealloc, fsync
-    let tmp_path = final_path.with_extension("upload.tmp");
-
-    struct TempGuard {
-        path: PathBuf,
-        committed: bool,
-    }
-
-    impl Drop for TempGuard {
-        fn drop(&mut self) {
-            if !self.committed {
-                let _ = std::fs::remove_file(&self.path);
+    if let Some(if_match) = headers.get(header::IF_MATCH).and_then(|h| h.to_str().ok()) {
+        let expected = if_match.trim();
+        if expected == "*" {
+            if !object_exists {
+                return Err(AppError::PreconditionFailed);
+            }
+        } else {
+            let expected_unquoted = expected.trim_matches('"');
+            if current_etag_unquoted.is_empty() || current_etag_unquoted != expected_unquoted {
+                return Err(AppError::PreconditionFailed);
             }
         }
     }
-
-    let mut guard = TempGuard {
-        path: tmp_path.clone(),
-        committed: false,
-    };
-
-    let file = fs::File::create(&tmp_path)
-        .await
-        .context("create temp")
-        .map_err(AppError::Internal)?;
-    let mut writer = BufWriter::with_capacity(512 * 1024, file);
-    if let Some(len) = content_len {
-        let _ = writer.get_mut().set_len(len).await;
-    }
-
-    let mut md5_hasher = Md5Context::new();
-    let mut sha256_hasher = Sha256::new();
-    let mut total_size = 0u64;
-    let mut body_stream = req.into_body().into_data_stream();
-
-    while let Some(chunk) = body_stream.next().await {
-        let chunk = chunk.context("read chunk").map_err(AppError::Internal)?;
-        let bytes = chunk.as_ref();
-        md5_hasher.consume(bytes);
-        sha256_hasher.update(bytes);
-        writer
-            .write_all(bytes)
-            .await
-            .context("write chunk")
-            .map_err(AppError::Internal)?;
-        total_size += bytes.len() as u64;
-    }
-
-    writer
-        .flush()
-        .await
-        .context("flush")
-        .map_err(AppError::Internal)?;
-    writer
-        .get_mut()
-        .sync_data()
-        .await
-        .context("sync_data")
-        .map_err(AppError::Internal)?;
-    writer
-        .get_mut()
-        .sync_all()
-        .await
-        .context("sync_all")
-        .map_err(AppError::Internal)?;
-
-    // 10) ETag + checksum verification
-    let md5_digest = md5_hasher.finalize();
-    let etag = format!("\"{}\"", hex::encode(md5_digest.0));
-
-    if let Some(md5_b64) = content_md5_b64 {
-        let computed_b64 = BASE64.encode(md5_digest.0);
-        if computed_b64 != md5_b64 {
-            return Err(AppError::PreconditionFailed);
-        }
-    }
-
-    if let Some(sha256_hex) = x_amz_sha256_hex {
-        if sha256_hex != "UNSIGNED-PAYLOAD" {
-            let computed_hex = hex::encode(sha256_hasher.finalize());
-            if computed_hex != sha256_hex {
+    if let Some(if_none_match) = headers.get(header::IF_NONE_MATCH).and_then(|h| h.to_str().ok()) {
+        let forbidden = if_none_match.trim();
+        if forbidden == "*" {
+            if object_exists {
+                return Err(AppError::PreconditionFailed);
+            }
+        } else {
+            let forbidden_unquoted = forbidden.trim_matches('"');
+            if object_exists && current_etag_unquoted == forbidden_unquoted {
                 return Err(AppError::PreconditionFailed);
             }
         }
     }
 
-    // 11) Archive previous version (before overwrite), then atomic commit
-    if versioning && old_size > 0 {
-        let archive_dir = parent.join(".s3versions").join(&safe_key);
-        let prev_version_id = obj_meta
-            .version_id
-            .clone()
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let archive_path = archive_dir.join(prev_version_id);
-        fs::create_dir_all(&archive_dir).await.ok();
+    // ────────────────────────────────
+    // SECTION 8: Versioning + Archive
+    // ────────────────────────────────
+    let new_version_id = if versioning { Some(Uuid::new_v4().to_string()) } else { None };
 
-        // Try hard link first (fast, space-efficient), fallback to copy
-        match fs::hard_link(&final_path, &archive_path).await {
-            Ok(_) => {}
-            Err(_) => {
-                let _ = fs::copy(&final_path, &archive_path).await;
+    if versioning && existed {
+        let prev_version_id = obj_meta.version_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
+        let archive_dir = parent.join(".s3versions").join(&safe_key);
+        fs::create_dir_all(&archive_dir).await.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+        let archive_path = archive_dir.join(prev_version_id);
+        if fs::hard_link(&base_path, &archive_path).await.is_err() {
+            fs::copy(&base_path, &archive_path).await.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+        }
+        if state.durability_enabled() {
+            let f = fs::File::open(&archive_path).await.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+            f.sync_all().await.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+            fsync_dir(&archive_dir).await;
+        }
+    }
+
+    // ────────────────────────────────
+    // SECTION 9: Temp File + Streaming Write
+    // ────────────────────────────────
+    let tmp_path = parent.join(format!("{}.{}.tmp", safe_key, Uuid::new_v4()));
+    let file = fs::File::create(&tmp_path).await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    let guard = TempGuard::new(tmp_path.clone());
+    let inner_writer = tokio::io::BufWriter::with_capacity(8 * 1024 * 1024, file);
+    let mut writer = ChecksumWriter::new(inner_writer);
+    let mut total_size = 0u64;
+    let mut body_stream = body.into_data_stream();
+    while let Some(chunk_res) = body_stream.next().await {
+        let chunk = match chunk_res {
+            Ok(c) => c,
+            Err(e) => {
+                guard.cleanup_async().await;
+                return Err(AppError::Internal(anyhow::anyhow!(format!("read chunk: {e}"))));
+            }
+        };
+        let bytes = chunk.as_ref();
+        if !bytes.is_empty() {
+            if total_size.saturating_add(bytes.len() as u64) > max_bytes {
+                guard.cleanup_async().await;
+                return Err(AppError::EntityTooLarge);
+            }
+            if let Err(e) = writer.write_all(bytes).await {
+                guard.cleanup_async().await;
+                return Err(AppError::Internal(anyhow::anyhow!(format!("write chunk: {e}"))));
+            }
+            total_size += bytes.len() as u64;
+        }
+    }
+    if let Some(expected_len) = content_len {
+        if total_size != expected_len {
+            guard.cleanup_async().await;
+            return Err(AppError::BadRequest("Content-Length mismatch".into()));
+        }
+    }
+
+    // ────────────────────────────────
+    // SECTION 10: Flush + Checksums
+    // ────────────────────────────────
+    if state.durability_enabled() {
+        writer.flush_and_sync().await?;
+    } else {
+        writer.flush().await.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    }
+    let (md5_bytes, sha256_bytes, _) = writer.finalize();
+    let etag = format!("\"{}\"", hex::encode(&md5_bytes));
+    if let Some(md5_b64) = content_md5_b64.as_ref() {
+        let computed_b64 = base64::engine::general_purpose::STANDARD.encode(&md5_bytes);
+        if &computed_b64 != md5_b64 {
+            guard.cleanup_async().await;
+            return Err(AppError::BadDigest("Content-MD5 mismatch".into()));
+        }
+    }
+    if let Some(sha256_hex) = x_amz_sha256_hex.as_ref() {
+        if sha256_hex != "UNSIGNED-PAYLOAD" {
+            let computed_hex = hex::encode(&sha256_bytes);
+            if &computed_hex != sha256_hex {
+                guard.cleanup_async().await;
+                return Err(AppError::Sha256Mismatch);
             }
         }
     }
 
-    // Atomic commit: rename temp -> canonical path
-    fs::rename(&tmp_path, &final_path)
-        .await
-        .context("rename temp->final")
-        .map_err(AppError::Internal)?;
-    guard.committed = true;
+    // ────────────────────────────────
+    // SECTION 11: Atomic Rename
+    // ────────────────────────────────
+    atomic_rename(&tmp_path, &base_path, state.durability_enabled()).await?;
 
-    // 12) Update object metadata
+    // ────────────────────────────────
+    // SECTION 12: Post-rename Transactional Updates
+    // ────────────────────────────────
+    fn spawn_incomplete_marker(parent: &Path, base_name: &std::ffi::OsStr) {
+        let parent = parent.to_path_buf();
+        let base_name = base_name.to_owned();
+        let _ = tokio::spawn(async move {
+            let marker = parent.join(format!(".incomplete.{}", base_name.to_string_lossy()));
+            let _ = fs::write(&marker, b"post-rename failure").await;
+            fsync_dir(&parent).await;
+        });
+    }
+    let base_name = base_path.file_name().unwrap().to_owned();
+
     obj_meta.etag = etag.clone();
     obj_meta.content_type = content_type;
     obj_meta.owner = user.0.username.clone();
     obj_meta.is_delete_marker = false;
     obj_meta.user_meta = user_meta;
     obj_meta.tags = tags;
-
-    // S3-compatible: use opaque UUID version IDs only; no numeric current_version
     obj_meta.version_id = new_version_id.clone();
 
-
-    let obj_json = serde_json::to_string_pretty(&obj_meta)
-        .context("serialize obj meta")
-        .map_err(AppError::Internal)?;
-
-    // --- xattr safety: ensure file exists before set ---
-    #[cfg(unix)]
-    {
-        if fs::metadata(&meta_marker).await.is_err() {
-            let _ = fs::File::create(&meta_marker).await;
-        }
-    }
-
-    set(&meta_marker, "user.s3.meta", obj_json.as_bytes())
+    save_object_meta(&meta_marker, &obj_meta, state.durability_enabled())
         .await
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("set obj meta: {e}")))?;
+        .map_err(|e| { spawn_incomplete_marker(&parent, &base_name); e })?;
 
-    // 13) Update bucket stats
     if is_new_object {
         bucket_meta.object_count = bucket_meta.object_count.saturating_add(1);
     }
     if versioning {
         bucket_meta.used_bytes = bucket_meta.used_bytes.saturating_add(total_size);
     } else {
-        let delta = if total_size >= old_size { total_size - old_size } else { 0 };
-        bucket_meta.used_bytes = bucket_meta.used_bytes.saturating_add(delta);
-    }
-
-    let bucket_json = serde_json::to_string_pretty(&bucket_meta)
-        .context("serialize bucket meta")
-        .map_err(AppError::Internal)?;
-
-    // --- xattr safety for bucket meta ---
-    #[cfg(unix)]
-    {
-        if fs::metadata(&bucket_meta_path).await.is_err() {
-            let _ = fs::File::create(&bucket_meta_path).await;
+        if total_size >= old_size {
+            bucket_meta.used_bytes =
+                bucket_meta.used_bytes.saturating_add(total_size - old_size);
+        } else {
+            bucket_meta.used_bytes =
+                bucket_meta.used_bytes.saturating_sub(old_size - total_size);
         }
     }
-
-    set(&bucket_meta_path, "user.s3.meta", bucket_json.as_bytes())
+    save_bucket_meta(&bucket_path, &bucket_meta, state.durability_enabled())
         .await
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("set bucket meta: {e}")))?;
+        .map_err(|e| { spawn_incomplete_marker(&parent, &base_name); e })?;
 
-    // 13b) Update index for prefix
+    // ────────────────────────────────
+    // SECTION 13: Index Update + Metrics (WAL-backed)
+    // ────────────────────────────────
     use chrono::{DateTime, Utc};
     let last_modified = DateTime::<Utc>::from(std::time::SystemTime::now())
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
-    let prefix = parent.strip_prefix(&bucket_path)
+    let prefix = parent
+        .strip_prefix(&bucket_path)
         .ok()
-        .map(|p| p.to_string_lossy().to_string())
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
         .unwrap_or_default();
 
-    let idx_path = bucket_path.join(".s3index").join(&prefix);
+    // Prefix-level lock to serialize index updates
+    let _idx_guard = state.io_locks.lock(format!("idx:{}/{}", bucket, prefix)).await;
 
-    #[cfg(unix)]
-    {
-        if fs::metadata(&idx_path).await.is_err() {
-            let _ = fs::File::create(&idx_path).await;
+    let index_entry = IndexEntry {
+        key: key.clone(),
+        size: total_size,
+        etag: etag.clone(),
+        last_modified: last_modified.clone(),
+        seq_no: 0, // assigned inside BucketIndex
+        is_delete: false,
+        version: new_version_id.clone(),
+    };
+
+    let idx = state.get_bucket_index(&bucket).await
+        .map_err(|e| {
+            spawn_incomplete_marker(&parent, &base_name);
+            AppError::Internal(anyhow::anyhow!(format!("open index: {e}")))
+        })?;
+
+    idx.put(index_entry).await
+        .map_err(|e| {
+            spawn_incomplete_marker(&parent, &base_name);
+            AppError::Internal(anyhow::anyhow!(format!("index put: {e}")))
+        })?;
+
+    if state.durability_enabled() {
+        if let Err(e) = idx.compact().await {
+            tracing::warn!(req_id, bucket=%bucket, key=%key, "index compact failed: {}", e);
         }
     }
 
-    let mut entries: Vec<IndexEntry> = match get(&idx_path, "s3.index").await {
-        Ok(Some(data)) => serde_json::from_slice(&data).unwrap_or_default(),
-        _ => Vec::new(),
-    };
+    PUT_BYTES.fetch_add(total_size, std::sync::atomic::Ordering::Relaxed);
 
-    if let Some(existing) = entries.iter_mut().find(|e| e.key == key) {
-        existing.last_modified = last_modified.clone();
-        existing.size = total_size;
-        existing.etag = etag.clone();
-    } else {
-        entries.push(IndexEntry {
-            key: key.clone(),
-            last_modified,
-            size: total_size,
-            etag: etag.clone(),
-        });
+
+    // ────────────────────────────────
+    // SECTION 14: Finalize + Response
+    // ────────────────────────────────
+    guard.mark_committed();
+
+    let mut resp_headers = S3Headers::common_headers();
+    resp_headers.insert(
+        header::ETAG,
+        HeaderValue::from_str(&etag)
+            .map_err(|e| AppError::Internal(anyhow::anyhow!(format!("invalid ETAG header: {e}"))))?,
+    );
+    resp_headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+    if let Some(v) = new_version_id.as_ref() {
+        resp_headers.insert(
+            "x-amz-version-id",
+            HeaderValue::from_str(v)
+                .map_err(|e| AppError::Internal(anyhow::anyhow!(format!("invalid version-id header: {e}"))))?,
+        );
     }
-    entries.sort_by(|a, b| a.key.cmp(&b.key));
+    resp_headers.insert(
+        "x-amz-request-id",
+        HeaderValue::from_str(&req_id)
+            .map_err(|e| AppError::Internal(anyhow::anyhow!(format!("invalid request-id header: {e}"))))?,
+    );
 
-    let data = serde_json::to_vec(&entries).map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
-    set(&idx_path, "s3.index", &data)
-        .await
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("set index: {e}")))?;
-
-    // 14) Metrics + trace
-    PUT_BYTES.fetch_add(total_size, Ordering::Relaxed);
     tracing::info!(
         req_id,
         bucket=%bucket,
@@ -596,17 +1073,273 @@ pub async fn put_object(
         "PUT commit success"
     );
 
-    // 15) Response
-    let mut headers = S3Headers::common_headers();
-    headers.insert(header::ETAG, HeaderValue::from_str(&etag).unwrap());
-    headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
-    if let Some(v) = new_version_id {
-        headers.insert("x-amz-version-id", HeaderValue::from_str(&v).unwrap());
-    }
-    headers.insert("x-amz-request-id", HeaderValue::from_str(&req_id).unwrap());
-
-    Ok((StatusCode::OK, headers))
+    Ok((StatusCode::OK, resp_headers))
 }
+
+
+
+
+
+/// Copy an object within or across buckets with durability, versioning, metadata, and index updates.
+/// Reads the source file, streams into a temp file while computing MD5/SHA256, then commits atomically.
+/// Honors conditional copy headers: x-amz-copy-source, x-amz-copy-source-if-match, x-amz-copy-source-if-none-match.
+/// Expects helpers: ChecksumWriter, TempGuard, atomic_rename (fsync both dirs), fsync_dir, 
+/// load/save_object_meta, load/save_bucket_meta, load/save_bucket_index, archive_previous_version,
+/// commit_object_transaction, encode_token, validate_bucket, validate_key, DurableOps.
+
+pub async fn copy_object(
+    State(state): State<Arc<AppState>>,
+    AxumPath((dst_bucket, dst_key)): AxumPath<(String, String)>,
+    user: Extension<AuthenticatedUser>,
+    req: axum::extract::Request,
+) -> Result<(StatusCode, HeaderMap), AppError> {
+    // ────────────────────────────────
+    // SECTION 0: Metrics + Validation
+    // ────────────────────────────────
+    PUT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let start = std::time::Instant::now();
+    validate_bucket(&dst_bucket)?;
+    validate_key(&dst_key)?;
+
+    // ────────────────────────────────
+    // SECTION 1: Parse Headers
+    // ────────────────────────────────
+    let (parts, _body) = req.into_parts();
+    let headers = parts.headers;
+    let copy_src = headers
+        .get("x-amz-copy-source")
+        .and_then(|h| h.to_str().ok())
+        .ok_or_else(|| AppError::BadRequest("Missing x-amz-copy-source".into()))?
+        .trim()
+        .trim_start_matches('/');
+
+    let mut src_parts = copy_src.splitn(2, '/');
+    let src_bucket = src_parts.next().ok_or_else(|| AppError::BadRequest("Invalid source bucket".into()))?.to_string();
+    let src_key = src_parts.next().ok_or_else(|| AppError::BadRequest("Invalid source key".into()))?.to_string();
+    validate_bucket(&src_bucket)?;
+    validate_key(&src_key)?;
+
+    let req_id = format!("copy-{}:{} -> {}:{}", src_bucket, src_key, dst_bucket, dst_key);
+    tracing::info!(req_id, src_bucket=%src_bucket, src_key=%src_key, dst_bucket=%dst_bucket, dst_key=%dst_key, "COPY begin");
+
+    // ────────────────────────────────
+    // SECTION 2: Authorization
+    // ────────────────────────────────
+    let allowed_src = check_bucket_permission(&state.pool, &user.0, &src_bucket, PermissionLevel::ReadOnly.as_str())
+        .await.map_err(AppError::Internal)?;
+    let allowed_dst = check_bucket_permission(&state.pool, &user.0, &dst_bucket, PermissionLevel::ReadWrite.as_str())
+        .await.map_err(AppError::Internal)?;
+    if !allowed_src || !allowed_dst {
+        return Err(AppError::AccessDenied);
+    }
+
+    // ────────────────────────────────
+    // SECTION 3: Concurrency Controls
+    // ────────────────────────────────
+    let _permit = state.io_budget.acquire().await.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    let _src_guard = state.io_locks.lock(format!("{}/{}", src_bucket, src_key)).await;
+    let _dst_guard = state.io_locks.lock(format!("{}/{}", dst_bucket, dst_key)).await;
+
+    // ────────────────────────────────
+    // SECTION 4: Paths + Bucket Meta
+    // ────────────────────────────────
+    let src_base = state.object_path(&src_bucket, &src_key);
+    let dst_base = state.object_path(&dst_bucket, &dst_key);
+    let src_bucket_path = state.bucket_path(&src_bucket);
+    let dst_bucket_path = state.bucket_path(&dst_bucket);
+    if !src_bucket_path.exists() || !dst_bucket_path.exists() {
+        return Err(AppError::NotFound("Bucket not found".into()));
+    }
+    if fs::metadata(&src_base).await.is_err() {
+        return Err(AppError::NoSuchKey);
+    }
+    let dst_parent = dst_base.parent().ok_or_else(|| AppError::BadRequest("Invalid destination path".into()))?.to_path_buf();
+    fs::create_dir_all(&dst_parent).await.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+
+    let mut dst_bucket_meta = load_bucket_meta(&dst_bucket_path).await?;
+    let versioning = dst_bucket_meta.versioning;
+    let dst_safe_key = encode_token(&dst_key);
+    let src_safe_key = encode_token(&src_key);
+    let dst_meta_marker = dst_parent.join(format!(".s3meta.{dst_safe_key}"));
+    let src_meta = load_object_meta(&src_base.parent().unwrap_or(&src_bucket_path), &src_safe_key)
+        .await.unwrap_or_else(|_| ObjectMeta::new(&user.0.username));
+
+    // ────────────────────────────────
+    // SECTION 5: Conditional Copy Checks
+    // ────────────────────────────────
+    let current_etag_unquoted = src_meta.etag.trim().trim_matches('"');
+    if let Some(if_match) = headers.get("x-amz-copy-source-if-match").and_then(|h| h.to_str().ok()) {
+        let expected = if_match.trim().trim_matches('"');
+        if !expected.is_empty() && current_etag_unquoted != expected {
+            return Err(AppError::PreconditionFailed);
+        }
+    }
+    if let Some(if_none_match) = headers.get("x-amz-copy-source-if-none-match").and_then(|h| h.to_str().ok()) {
+        let forbidden = if_none_match.trim().trim_matches('"');
+        if !forbidden.is_empty() && current_etag_unquoted == forbidden {
+            return Err(AppError::PreconditionFailed);
+        }
+    }
+
+    // ────────────────────────────────
+    // SECTION 6: Versioning + Archive
+    // ────────────────────────────────
+    let new_version_id = if versioning { Some(Uuid::new_v4().to_string()) } else { None };
+    if versioning {
+        let prev_version_id = load_object_meta(&dst_parent, &dst_safe_key)
+            .await.ok().and_then(|m| m.version_id)
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        archive_previous_version(&state, &dst_base, &dst_parent, &dst_safe_key, &prev_version_id).await?;
+    }
+
+    // ────────────────────────────────
+    // SECTION 7: Copy Stream
+    // ────────────────────────────────
+    let tmp_path = dst_parent.join(format!("{}.{}.tmp", dst_safe_key, Uuid::new_v4()));
+    let dst_file = fs::File::create(&tmp_path).await.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    let guard = TempGuard::new(tmp_path.clone());
+    let dst_buf = tokio::io::BufWriter::with_capacity(8 * 1024 * 1024, dst_file);
+    let mut writer = ChecksumWriter::new(dst_buf);
+    let mut src_file = fs::File::open(&src_base).await.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    let mut total_size = 0u64;
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = src_file.read(&mut buf).await.map_err(|e| {
+            futures::executor::block_on(guard.cleanup_async());
+            AppError::Internal(anyhow::anyhow!(format!("read source: {e}")))
+        })?;
+        if n == 0 { break; }
+        writer.write_all(&buf[..n]).await.map_err(|e| {
+            futures::executor::block_on(guard.cleanup_async());
+            AppError::Internal(anyhow::anyhow!(format!("write dst: {e}")))
+        })?;
+        total_size += n as u64;
+    }
+
+    // ────────────────────────────────
+    // SECTION 8: Flush + Checksums
+    // ────────────────────────────────
+    if state.durability_enabled() {
+        writer.flush_and_sync().await?;
+    } else {
+        writer.flush().await.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    }
+    let (md5_bytes, _sha256_bytes, _) = writer.finalize();
+    let etag = format!("\"{}\"", hex::encode(&md5_bytes));
+
+    // ────────────────────────────────
+    // SECTION 9: Destination Meta + Bucket Stats
+    // ────────────────────────────────
+    let mut dst_obj_meta = src_meta.clone();
+    dst_obj_meta.etag = etag.clone();
+    dst_obj_meta.owner = user.0.username.clone();
+    dst_obj_meta.version_id = new_version_id.clone();
+    dst_obj_meta.is_delete_marker = false;
+
+    let dst_existed = fs::metadata(&dst_base).await.is_ok();
+    if !dst_existed {
+        dst_bucket_meta.object_count = dst_bucket_meta.object_count.saturating_add(1);
+    }
+    if versioning {
+        dst_bucket_meta.used_bytes = dst_bucket_meta.used_bytes.saturating_add(total_size);
+    } else {
+        let old_size = fs::metadata(&dst_base).await.map(|m| m.len()).unwrap_or(0);
+        if total_size >= old_size {
+            dst_bucket_meta.used_bytes = dst_bucket_meta.used_bytes.saturating_add(total_size - old_size);
+        } else {
+            dst_bucket_meta.used_bytes = dst_bucket_meta.used_bytes.saturating_sub(old_size - total_size);
+        }
+    }
+
+    // ────────────────────────────────
+    // SECTION 10: WAL-backed Index Update
+    // ────────────────────────────────
+    use chrono::Utc;
+    let last_modified = DateTime::<Utc>::from(std::time::SystemTime::now())
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+    let idx = state.get_bucket_index(&dst_bucket).await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(format!("open index: {e}"))))?;
+
+    let entry = IndexEntry {
+        key: dst_key.clone(),
+        size: total_size,
+        etag: etag.clone(),
+        last_modified,
+        seq_no: 0, // assigned inside BucketIndex
+        is_delete: false,
+        version: new_version_id.clone(),
+    };
+
+    idx.put(entry).await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(format!("index put: {e}"))))?;
+
+    if state.durability_enabled() {
+        if let Err(e) = idx.compact().await {
+            tracing::warn!(req_id, dst_bucket=%dst_bucket, dst_key=%dst_key, "index compact failed: {}", e);
+        }
+    }
+
+    // ────────────────────────────────
+    // SECTION 11: Transactional Commit
+    // ────────────────────────────────
+    commit_object_transaction(
+        &state,
+        &tmp_path,
+        &dst_base,
+        &dst_parent,
+        &dst_meta_marker,
+        &dst_obj_meta,
+        &dst_bucket_path,
+        &dst_bucket_meta,
+        &idx, // WAL-backed index
+    ).await?;
+
+    // Mark temp guard committed only after successful transaction
+    guard.mark_committed();
+
+    PUT_BYTES.fetch_add(total_size, std::sync::atomic::Ordering::Relaxed);
+
+    // ────────────────────────────────
+    // SECTION 12: Response
+    // ────────────────────────────────
+    let mut resp_headers = S3Headers::common_headers();
+    resp_headers.insert(
+        header::ETAG,
+        HeaderValue::from_str(&etag)
+            .map_err(|e| AppError::Internal(anyhow::anyhow!(format!("invalid ETAG: {e}"))))?,
+    );
+    resp_headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+    if let Some(v) = new_version_id.as_ref() {
+        resp_headers.insert(
+            "x-amz-version-id",
+            HeaderValue::from_str(v)
+                .map_err(|e| AppError::Internal(anyhow::anyhow!(format!("invalid version-id: {e}"))))?,
+        );
+    }
+    resp_headers.insert(
+        "x-amz-request-id",
+        HeaderValue::from_str(&req_id)
+            .map_err(|e| AppError::Internal(anyhow::anyhow!(format!("invalid request-id: {e}"))))?,
+    );
+
+    tracing::info!(
+        req_id,
+        src_bucket=%src_bucket,
+        src_key=%src_key,
+        dst_bucket=%dst_bucket,
+        dst_key=%dst_key,
+        bytes=%total_size,
+        ms=%start.elapsed().as_millis(),
+        etag=%etag,
+        version_id=?new_version_id,
+        "COPY commit success"
+    );
+
+    Ok((StatusCode::OK, resp_headers))
+}
+
+
 
 
 
@@ -620,38 +1353,26 @@ pub async fn get_object(
     user: Extension<AuthenticatedUser>,
     _req: axum::http::Request<Body>,
 ) -> Result<impl IntoResponse, AppError> {
-    // 0. Global IO permit (limit concurrent heavy IO)
+    // 0. Global IO permit
     let _io_permit = GLOBAL_IO_SEMAPHORE.acquire().await.unwrap();
-
     info!("GET {}/{}?{:?}", bucket, key, params);
 
     // 1. Permission
-    // if !check_bucket_permission(&state.pool, &user.0, &bucket, PermissionLevel::ReadOnly.as_str())
-    //     .await
-    //     .map_err(AppError::Internal)?
-    // {
-    //     return Err(AppError::AccessDenied);
-    // }
-
     let can_read = check_bucket_permission(
         &state.pool,
         &user.0,
         &bucket,
-        PermissionLevel::ReadOnly.as_str()
+        PermissionLevel::ReadOnly.as_str(),
     ).await?;
-
     let can_rw = check_bucket_permission(
         &state.pool,
         &user.0,
         &bucket,
-        PermissionLevel::ReadWrite.as_str()
+        PermissionLevel::ReadWrite.as_str(),
     ).await?;
-
     if !can_read && !can_rw {
         return Err(AppError::AccessDenied);
     }
-
-
 
     // 2. Paths
     let bucket_path = state.bucket_path(&bucket);
@@ -669,7 +1390,7 @@ pub async fn get_object(
         return Ok((StatusCode::OK, hdrs, Body::empty()).into_response());
     }
 
-    // 4. Bucket versioning flag (same pattern as PUT)
+    // 4. Bucket versioning flag
     let versioning = get(&bucket_path.join(".s3meta"), "user.s3.meta")
         .await
         .ok()
@@ -679,50 +1400,52 @@ pub async fn get_object(
         .and_then(|v| v.get("versioning")?.as_bool())
         .unwrap_or(false);
 
-    // 5. Load object metadata to decide latest/delete-marker/version
+    // 5. Consult WAL-backed index first
+    let idx = state.get_bucket_index(&bucket).await
+        .map_err(|e| AppError::Internal(anyhow!(format!("open index: {e}"))))?;
+    match idx.get(&key).await {
+        GetResult::Deleted(_) => return Err(AppError::NoSuchKey),
+        GetResult::NotFound => return Err(AppError::NoSuchKey),
+        GetResult::Found(_entry) => {
+            // continue; we still load object_meta for content_type, tags, etc.
+        }
+    }
+
+    // 6. Load object metadata
     let obj_meta = load_object_meta(&parent, &safe_key).await?;
     let req_version = params.get("versionId").cloned();
 
-    // 6. Version resolution
-    // - If versioning ON and latest is a delete marker:
-    //   - No versionId → 404
-    //   - versionId == latest delete marker → 404
-    // - If versioning ON and versionId provided:
-    //   - If versionId == latest non-delete → serve canonical file
-    //   - Else → serve archived file under .s3versions/{safe_key}/{versionId}
-    // - If versioning OFF → serve canonical file or 404 if missing
+    // 7. Version resolution
     let object_path = if versioning {
         match (&req_version, obj_meta.version_id.clone(), obj_meta.is_delete_marker) {
-            (None, _, true) => return Err(AppError::NoSuchKey), // latest is delete marker
+            (None, _, true) => return Err(AppError::NoSuchKey),
             (Some(vid), Some(latest_vid), true) if &latest_vid == vid => return Err(AppError::NoSuchKey),
             (Some(vid), Some(latest_vid), false) if &latest_vid == vid => full_key_path.clone(),
             (Some(vid), _, _) => {
-                // archived version
                 let archive_path = parent.join(".s3versions").join(&safe_key).join(vid);
                 if !archive_path.exists() {
                     return Err(AppError::NotFound(format!("version {}", vid)));
                 }
                 archive_path
             }
-            // No versionId, latest is not a delete marker
             (None, _, false) => full_key_path.clone(),
         }
     } else {
         full_key_path.clone()
     };
 
-    // 7. Open file
-    let mut file = File::open(&object_path)
-        .await
-        .map_err(|e| if e.kind() == std::io::ErrorKind::NotFound {
+    // 8. Open file
+    let mut file = File::open(&object_path).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
             AppError::NoSuchKey
         } else {
             AppError::Io(e)
-        })?;
+        }
+    })?;
     let file_meta = file.metadata().await.context("file metadata")?;
     let total_size = file_meta.len();
 
-    // 8. Conditional headers support (ETag-based)
+    // 9. Conditional headers
     if let Some(if_none) = headers.get(axum::http::header::IF_NONE_MATCH).and_then(|h| h.to_str().ok()) {
         if if_none.split(',').any(|tag| tag.trim() == obj_meta.etag) {
             let mut hdrs = S3Headers::common_headers();
@@ -742,7 +1465,7 @@ pub async fn get_object(
         }
     }
 
-    // 9. Range parsing
+    // 10. Range parsing
     let range_header = headers.get(axum::http::header::RANGE).and_then(|v| v.to_str().ok());
     let (start, end, is_partial) = if let Some(range) = range_header {
         let ranges = HttpRange::parse(range, total_size)
@@ -757,18 +1480,17 @@ pub async fn get_object(
     };
     let content_length = end - start + 1;
 
-    // 10. Platform safety: reject if > usize::MAX
+    // 11. Platform safety
     if total_size > usize::MAX as u64 {
-        return Err(AppError::Internal(anyhow::anyhow!(
+        return Err(AppError::Internal(anyhow!(
             "File too large for platform (max {} bytes)",
             usize::MAX
         )));
     }
 
-    // 11. sendfile fast path (UNIX only, full file, no range)
+    // 12. sendfile fast path
     let use_sendfile = cfg!(unix) && !is_partial && content_length == total_size;
     if use_sendfile {
-        // Build headers
         let mut resp = axum::response::Response::builder()
             .status(StatusCode::OK)
             .header(axum::http::header::CONTENT_TYPE, &obj_meta.content_type)
@@ -784,68 +1506,45 @@ pub async fn get_object(
                 resp = resp.header("x-amz-version-id", v);
             }
         }
-        let mut response = resp.body(Body::empty()).map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+        let mut response = resp.body(Body::empty()).map_err(|e| AppError::Internal(anyhow!(e)))?;
         if try_sendfile(&mut file, 0, total_size, &mut response).await? {
             info!("sendfile served {object_path:?} | {total_size} bytes | ETag: {}", obj_meta.etag);
             return Ok(response);
         }
-        // fall through if sendfile failed
     }
 
-    // 12. Linux readahead hint (sequential)
+    // 13. Linux readahead hint
     #[cfg(target_os = "linux")]
     {
         use nix::fcntl::{posix_fadvise, PosixFadviseAdvice};
         let fd = file.as_raw_fd();
         let _ = posix_fadvise(fd, 0, 0, PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL);
     }
-
-    // 13. Seek for range
+    // 14. Seek for range
     if is_partial {
         file.seek(std::io::SeekFrom::Start(start)).await.context("seek")?;
     }
 
-    // 14. 32/64-bit safe streaming via ReaderStream.take(limit)
-
-    // const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
-    // let chunk_size_u64 = CHUNK_SIZE as u64;
-    // let num_chunks_u64 = if content_length == 0 {
-    //     0
-    // } else {
-    //     (content_length + chunk_size_u64 - 1) / chunk_size_u64
-    // };
-
-    // let (body, response_content_length): (Body, u64) = if mem::size_of::<usize>() == 8 {
-    //     // 64-bit
-    //     let stream = ReaderStream::with_capacity(file, CHUNK_SIZE).take(num_chunks_u64 as usize);
-    //     (Body::from_stream(stream), content_length)
-    // } else {
-    //     // 32-bit
-    //     const MAX_32BIT_SAFE: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB guidance
-    //     if content_length > MAX_32BIT_SAFE {
-    //         let stream = ReaderStream::with_capacity(file, CHUNK_SIZE);
-    //         (Body::from_stream(stream), content_length)
-    //     } else {
-    //         let limit: usize = num_chunks_u64
-    //             .try_into()
-    //             .map_err(|_| AppError::Internal(anyhow::anyhow!("Chunk count exceeds usize::MAX on 32-bit")))?;
-    //         let stream = ReaderStream::with_capacity(file, CHUNK_SIZE).take(limit);
-    //         (Body::from_stream(stream), content_length)
-    //     }
-    // };
-
+    // 15. Stream response
     const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
     let stream = ReaderStream::with_capacity(file, CHUNK_SIZE);
-    // Stream until EOF; match Content-Length with actual bytes that will be sent.
     let body = Body::from_stream(stream);
     let response_content_length = content_length;
 
-
-    // 15. Headers
+    // 16. Headers
     let mut resp_headers = S3Headers::common_headers();
-    resp_headers.insert(axum::http::header::CONTENT_TYPE, obj_meta.content_type.parse().unwrap());
-    resp_headers.insert(axum::http::header::ACCEPT_RANGES, "bytes".parse().unwrap());
-    resp_headers.insert(axum::http::header::ETAG, obj_meta.etag.parse().unwrap());
+    resp_headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        obj_meta.content_type.parse().unwrap(),
+    );
+    resp_headers.insert(
+        axum::http::header::ACCEPT_RANGES,
+        "bytes".parse().unwrap(),
+    );
+    resp_headers.insert(
+        axum::http::header::ETAG,
+        obj_meta.etag.parse().unwrap(),
+    );
     resp_headers.insert(
         axum::http::header::LAST_MODIFIED,
         HeaderValue::from_str(&httpdate::fmt_http_date(file_meta.modified()?)).unwrap(),
@@ -861,9 +1560,17 @@ pub async fn get_object(
             format!("bytes {start}-{end}/{total_size}").parse().unwrap(),
         );
     }
-    resp_headers.insert(axum::http::header::CONTENT_LENGTH, response_content_length.to_string().parse().unwrap());
+    resp_headers.insert(
+        axum::http::header::CONTENT_LENGTH,
+        response_content_length.to_string().parse().unwrap(),
+    );
 
-    let status = if is_partial { StatusCode::PARTIAL_CONTENT } else { StatusCode::OK };
+    // 17. Status
+    let status = if is_partial {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
 
     info!(
         "Serving {object_path:?} | {response_content_length} bytes | Range: {is_partial} | ETag: {}",
@@ -872,6 +1579,7 @@ pub async fn get_object(
 
     Ok((status, resp_headers, body).into_response())
 }
+
 
 
 // -------- sendfile helper (unchanged behavior) --------
@@ -951,64 +1659,9 @@ pub async fn presign_object(
 
 
 
-/// Walk the bucket, skip every `.s3meta*` file and return:
-/// * `files` – (relative Path, mtime, size)
-/// * `dirs`  – (relative Path) of every directory
-pub async fn traverse_and_get_keys(
-    root: &Path,
-    base: &Path,
-    files: &mut Vec<(PathBuf, SystemTime, u64)>,
-    dirs: &mut Vec<String>,
-) -> Result<(), AppError> {
-    use std::collections::VecDeque;
-    let mut stack = VecDeque::from([root.to_path_buf()]);
-
-    while let Some(dir) = stack.pop_back() {
-        let mut entries = fs::read_dir(&dir).await.context("read dir")?;
-
-        while let Some(entry) = entries.next_entry().await.context("next entry")? {
-            let path = entry.path();
-            let meta = fs::symlink_metadata(&path).await.context("metadata")?;
-            if meta.is_symlink() {
-                continue; // skip symlinks to avoid recursion loops
-            }
-
-            // Skip hidden/system metadata and version directories
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name == ".s3meta"
-                    || name == ".s3meta.json"
-                    || name.starts_with(".s3meta.")
-                    || name == ".s3versions"
-                    || name == ".s3index"
-                {
-                    continue;
-                }
-            }
-
-            if meta.is_file() {
-                if let Ok(rel) = path.strip_prefix(base) {
-                    files.push((
-                        rel.to_path_buf(),
-                        meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-                        meta.len(),
-                    ));
-                }
-            } else if meta.is_dir() {
-                if let Ok(rel) = path.strip_prefix(base) {
-                    dirs.push(format!("{}/", rel.to_string_lossy().replace('\\', "/")));
-                }
-                stack.push_back(path);
-            }
-        }
-    }
-    Ok(())
-}
-
-
 // -----------------------------------------------------------------------------
 //  S3 LIST Objects Operation
 // -----------------------------------------------------------------------------
-
 pub async fn list_objects(
     State(state): State<Arc<AppState>>,
     AxumPath(bucket): AxumPath<String>,
@@ -1044,27 +1697,29 @@ pub async fn list_objects(
         }
     }
 
-    // --- Load index ---
-    let idx_path = root.join(".s3index").join(&prefix);
-    let mut entries: Vec<IndexEntry> = match get(&idx_path, "s3.index").await {
-        Ok(Some(data)) => serde_json::from_slice(&data).unwrap_or_default(),
-        _ => {
-            // fallback: scan filesystem if index missing
-            let mut files = Vec::new();
-            let mut dirs = Vec::new();
-            traverse_and_get_keys(&root, &root, &mut files, &mut dirs).await?;
-            files.sort_by_key(|f| f.0.clone());
-            files.into_iter().map(|(path, mtime, size)| {
-                IndexEntry {
-                    key: path.to_string_lossy().replace('\\', "/"),
-                    last_modified: DateTime::<Utc>::from(mtime)
-                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                    size,
-                    etag: format!("\"{}\"", hex::encode(md5::compute(format!("{}{}", path.display(), size).as_bytes()).0)),
-                }
-            }).collect()
+    // --- Load entries from WAL-backed index ---
+    let idx = state.get_bucket_index(&bucket).await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(format!("open index: {e}"))))?;
+    let results = idx.list_prefix(&prefix).await;
+
+    // Convert GetResult → IndexEntry-like
+    let mut entries: Vec<(String, String, u64, String)> = Vec::new();
+    for res in results {
+        match res {
+            GetResult::Found(entry) => {
+                entries.push((
+                    entry.key.clone(),
+                    entry.last_modified.clone(),
+                    entry.size,
+                    entry.etag.clone(),
+                ));
+            }
+            GetResult::Deleted(_) => {
+                // skip tombstoned keys
+            }
+            GetResult::NotFound => {}
         }
-    };
+    }
 
     // --- Filter + paginate ---
     let mut objects = Vec::new();
@@ -1073,14 +1728,14 @@ pub async fn list_objects(
     let mut emitted = 0usize;
     let mut last_key_emitted: Option<String> = None;
 
-    for entry in entries.into_iter().filter(|e| e.key > start_after_key) {
-        if !prefix.is_empty() && !entry.key.starts_with(&prefix) {
+    for (key, last_modified, size, etag) in entries.into_iter().filter(|(k, _, _, _)| k > &start_after_key) {
+        if !prefix.is_empty() && !key.starts_with(&prefix) {
             continue;
         }
 
         // delimiter handling
         if !delimiter.is_empty() {
-            if let Some(rest) = entry.key.strip_prefix(&prefix) {
+            if let Some(rest) = key.strip_prefix(&prefix) {
                 if let Some(pos) = rest.find(&delimiter) {
                     prefixes.insert(format!("{}{}", prefix, &rest[..pos + delimiter.len()]));
                     continue;
@@ -1089,14 +1744,14 @@ pub async fn list_objects(
         }
 
         objects.push(ObjectInfo {
-            key: entry.key.clone(),
-            last_modified: entry.last_modified.clone(),
-            size_bytes: entry.size,
-            etag: entry.etag.clone(),
+            key: key.clone(),
+            last_modified,
+            size_bytes: size,
+            etag,
         });
 
         emitted += 1;
-        last_key_emitted = Some(entry.key.clone());
+        last_key_emitted = Some(key.clone());
 
         if emitted >= max_keys {
             break;
@@ -1111,21 +1766,6 @@ pub async fn list_objects(
         }
     }
 
-    // Build XML response
-    // let result = ListBucketResult {
-    //     xmlns: S3_XMLNS,
-    //     bucket_name: bucket,
-    //     prefix: (!prefix.is_empty()).then_some(prefix),
-    //     delimiter: (!delimiter.is_empty()).then_some(delimiter),
-    //     start_after: (!query.start_after.clone().unwrap_or_default().is_empty())
-    //         .then_some(query.start_after.clone().unwrap()),
-    //     continuation_token: query.continuation_token.clone(),
-    //     next_continuation_token: next_token.clone(),
-    //     max_keys: max_keys_s3,
-    //     is_truncated,
-    //     objects,
-    //     common_prefixes: prefixes.into_iter().map(|p| CommonPrefix { prefix: p }).collect(),
-    // };
     let result = ListBucketResult {
         xmlns: S3_XMLNS,
         bucket_name: bucket,
@@ -1154,162 +1794,12 @@ pub async fn list_objects(
 
 
 
-// pub async fn list_objects(
-//     State(state): State<Arc<AppState>>,
-//     AxumPath(bucket): AxumPath<String>,
-//     Query(query): Query<ListObjectsQuery>,
-//     user: axum::Extension<AuthenticatedUser>,
-// ) -> Result<(HeaderMap, String), AppError> {
-//     tracing::info!(
-//         "LIST Request: Bucket='{}', Query={:?}, User='{}'",
-//         bucket,
-//         query,
-//         user.0.username
-//     );
-
-//     // ---- 1. Permission ----------------------------------------------------
-//     if !check_bucket_permission(
-//         &state.pool,
-//         &user.0,
-//         &bucket,
-//         PermissionLevel::ReadOnly.as_str(),
-//     )
-//     .await
-//     .map_err(AppError::Internal)?
-//     {
-//         return Err(AppError::AccessDenied);
-//     }
-
-//     let bucket_root = state.bucket_path(&bucket);
-//     if !bucket_root.exists() {
-//         return Err(AppError::NotFound(bucket));
-//     }
-
-//     // ---- 2. Query parameters (S3 uses u32) -------------------------------
-//     let prefix = query.prefix.unwrap_or_default();
-//     let delimiter = query.delimiter.unwrap_or_default();
-//     let marker = query.marker.unwrap_or_default();
-
-//     // S3: max-keys is u32, cap at 1000
-//     let max_keys_s3: u32 = query.max_keys.unwrap_or(1000).min(1000);
-//     let max_keys: usize = max_keys_s3 as usize; // ← 100% safe
-
-//     // ---- 3. Gather every *real* file (skip .s3meta.*) --------------------
-//     let mut all_keys_metadata = Vec::<(PathBuf, SystemTime, u64)>::new();
-//     traverse_and_get_keys(&bucket_root, &bucket_root, &mut all_keys_metadata).await?;
-//     all_keys_metadata.sort_by(|a, b| a.0.cmp(&b.0));
-
-//     // ---- 4. Filter & apply S3 semantics ---------------------------------
-//     let mut objects = Vec::<ObjectInfo>::new();
-//     let mut common_prefixes = HashSet::<String>::new();
-//     let mut processed = 0usize;
-//     let mut is_truncated = false;
-
-//     for (rel_path, modified, size) in all_keys_metadata {
-//         let key = rel_path.to_string_lossy().replace('\\', "/");
-
-//         // Skip marker
-//         if !marker.is_empty() && key <= marker {
-//             continue;
-//         }
-
-//         // Skip prefix
-//         if !prefix.is_empty() && !key.starts_with(&prefix) {
-//             continue;
-//         }
-
-//         // Delimiter → CommonPrefixes
-//         if !delimiter.is_empty() {
-//             if let Some(rest) = key.strip_prefix(&prefix) {
-//                 if let Some(pos) = rest.find(&delimiter) {
-//                     let cp = format!("{}{}", prefix, &rest[..pos + delimiter.len()]);
-//                     common_prefixes.insert(cp);
-//                     continue;
-//                 }
-//             }
-//         }
-
-//         // Max keys
-//         if processed >= max_keys {
-//             is_truncated = true;
-//             break;
-//         }
-
-//         // Skip bucket metadata files
-//         if let Some(name) = rel_path.file_name().and_then(|n| n.to_str()) {
-//             if name == ".s3meta" || name == ".s3meta.json" {
-//                 continue;
-//             }
-//         }
-
-//         // Load object metadata
-//         let safe_key = key.replace('/', "_");
-//         let meta_path = bucket_root.join(&rel_path).parent().unwrap().join(format!(".s3meta.{}", safe_key));
-
-//         let obj_meta = match get(&meta_path, "user.s3.meta")
-//             .ok()
-//             .flatten()
-//             .and_then(|b| String::from_utf8(b).ok())
-//             .and_then(|s| serde_json::from_str::<ObjectMeta>(&s).ok())
-//         {
-//             Some(meta) => meta,
-//             None => ObjectMeta {
-//                 etag: format!("\"{}\"", hex::encode(md5::compute(format!("{}{}", key, size).as_bytes()).0)),
-//                 content_type: "application/octet-stream".to_string(),
-//                 ..Default::default()
-//             },
-//         };
-
-//         let last_modified = DateTime::<Utc>::from(modified)
-//             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-
-//         objects.push(ObjectInfo {
-//             key,
-//             last_modified,
-//             size_bytes: size,
-//             etag: obj_meta.etag,
-//         });
-
-//         processed += 1;
-//     }
-
-//     // ---- 5. Build XML (S3 expects u32) -----------------------------------
-//     let result = ListBucketResult {
-//         xmlns: S3_XMLNS,
-//         bucket_name: bucket.clone(),
-//         prefix: (!prefix.is_empty()).then_some(prefix),
-//         delimiter: (!delimiter.is_empty()).then_some(delimiter),
-//         marker: (!marker.is_empty()).then_some(marker),
-//         max_keys: max_keys_s3,  // ← u32
-//         is_truncated,
-//         objects,
-//         common_prefixes: common_prefixes
-//             .into_iter()
-//             .map(|p| CommonPrefix { prefix: p })
-//             .collect(),
-//     };
-
-//     let xml_body = quick_xml::se::to_string(&result)
-//         .map_err(|e| AppError::Internal(anyhow::anyhow!("XML serialization: {e}")))?;
-
-//     let mut headers = S3Headers::xml_headers();
-//     headers.insert(
-//         header::CONTENT_LENGTH,
-//         HeaderValue::from_str(&xml_body.len().to_string())
-//             .expect("content-length is valid"),
-//     );
-
-//     Ok((headers, xml_body))
-// }
 
 
 
 
 
-
-
-// S3 DELETE Object Operation
-// S3 DELETE Object Operation
+//DELETE OPERATION
 pub async fn delete_object(
     State(state): State<Arc<AppState>>,
     AxumPath((bucket, key)): AxumPath<(String, String)>,
@@ -1363,19 +1853,13 @@ pub async fn delete_object(
     // 5) Versioning behavior
     let mut version_id = None;
     if versioning {
-        // Instead of deleting, mark delete marker
+        // Mark delete marker in object meta
         version_id = Some(Uuid::new_v4().to_string());
         obj_meta.is_delete_marker = true;
         obj_meta.version_id = version_id.clone();
 
         let obj_json = serde_json::to_string_pretty(&obj_meta)
             .map_err(|e| AppError::Internal(anyhow::Error::new(e)))?;
-        #[cfg(unix)]
-        {
-            if fs::metadata(&meta_marker).await.is_err() {
-                let _ = fs::File::create(&meta_marker).await;
-            }
-        }
         set(&meta_marker, "user.s3.meta", obj_json.as_bytes()).await?;
     } else {
         // Physically delete object + metadata
@@ -1390,34 +1874,34 @@ pub async fn delete_object(
     }
     let bucket_json = serde_json::to_string_pretty(&bucket_meta)
         .map_err(|e| AppError::Internal(anyhow::Error::new(e)))?;
-    #[cfg(unix)]
-    {
-        if fs::metadata(&bucket_meta_path).await.is_err() {
-            let _ = fs::File::create(&bucket_meta_path).await;
-        }
-    }
     set(&bucket_meta_path, "user.s3.meta", bucket_json.as_bytes()).await?;
 
-    // 7) Update index (prune key)
-    let prefix = parent.strip_prefix(&bucket_path)
-        .ok()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let idx_path = bucket_path.join(".s3index").join(&prefix);
-    #[cfg(unix)]
-    {
-        if fs::metadata(&idx_path).await.is_err() {
-            let _ = fs::File::create(&idx_path).await;
+    // 7) WAL-backed index update (append tombstone)
+    use chrono::Utc;
+    let last_modified = DateTime::<Utc>::from(std::time::SystemTime::now())
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+    let idx = state.get_bucket_index(&bucket).await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(format!("open index: {e}"))))?;
+
+    let tombstone = IndexEntry {
+        key: key.clone(),
+        size: 0,
+        etag: "".to_string(),
+        last_modified,
+        seq_no: 0, // assigned inside BucketIndex
+        is_delete: true,
+        version: version_id.clone(),
+    };
+
+    idx.put(tombstone).await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(format!("index tombstone: {e}"))))?;
+
+    if state.durability_enabled() {
+        if let Err(e) = idx.compact().await {
+            tracing::warn!("index compact failed after delete: {}", e);
         }
     }
-    let mut entries: Vec<IndexEntry> = match get(&idx_path, "s3.index").await {
-        Ok(Some(data)) => serde_json::from_slice(&data).unwrap_or_default(),
-        _ => Vec::new(),
-    };
-    entries.retain(|e| e.key != key);
-    let data = serde_json::to_vec(&entries)
-        .map_err(|e| AppError::Internal(anyhow::Error::new(e)))?;
-    set(&idx_path, "s3.index", &data).await?;
 
     // 8) Response
     let mut headers = S3Headers::common_headers();
@@ -1425,10 +1909,14 @@ pub async fn delete_object(
     if let Some(v) = version_id {
         headers.insert("x-amz-version-id", HeaderValue::from_str(&v).unwrap());
     }
-    headers.insert("x-amz-request-id", HeaderValue::from_str(&format!("del-{}-{}", bucket, key)).unwrap());
+    headers.insert(
+        "x-amz-request-id",
+        HeaderValue::from_str(&format!("del-{}-{}", bucket, key)).unwrap(),
+    );
 
     Ok((StatusCode::NO_CONTENT, headers))
 }
+
 
 
 //metapath TODO to be implemented
@@ -1542,93 +2030,456 @@ pub async fn head_object(
 }
 
 
+//---------------------------------
+//MULT-PART UPLOAD
+//---------------------------------
+pub async fn initiate_multipart_upload(
+    State(state): State<Arc<AppState>>,
+    AxumPath((bucket, key)): AxumPath<(String, String)>,
+    user: Extension<AuthenticatedUser>,
+) -> Result<(StatusCode, HeaderMap, String), AppError> {
+    // ────────────────────────────────
+    // SECTION 0: Validation + AuthZ
+    // ────────────────────────────────
+    validate_bucket(&bucket)?;
+    validate_key(&key)?;
 
-//DELETE WITH MARKER
-// pub async fn delete_object(
-//     State(state): State<Arc<AppState>>,
-//     AxumPath((bucket, key)): AxumPath<(String, String)>,
-//     user: axum::Extension<AuthenticatedUser>,
-// ) -> Result<(StatusCode, HeaderMap), AppError> {
-//     tracing::info!("DELETE {}/{}", bucket, key);
+    let allowed = check_bucket_permission(&state.pool, &user.0, &bucket, PermissionLevel::ReadWrite.as_str())
+        .await.map_err(AppError::Internal)?;
+    if !allowed {
+        return Err(AppError::AccessDenied);
+    }
 
-//     // 1. Permission
-//     check_bucket_permission(&state.pool, &user.0, &bucket, PermissionLevel::ReadWrite.as_str())
-//         .await
-//         .map_err(AppError::Internal)?
-//         .then_some(())
-//         .ok_or(AppError::AccessDenied)?;
+    // ────────────────────────────────
+    // SECTION 1: Paths + marker
+    // ────────────────────────────────
+    let bucket_path = state.bucket_path(&bucket);
+    if !bucket_path.exists() {
+        return Err(AppError::NotFound(bucket.clone()));
+    }
+    let uploads_dir = bucket_path.join(".s3uploads");
+    fs::create_dir_all(&uploads_dir).await.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
 
-//     let bucket_path = state.bucket_path(&bucket);
-//     if !bucket_path.exists() {
-//         return Err(AppError::NotFound(bucket));
-//     }
+    let upload_id = Uuid::new_v4().to_string();
+    let marker_path = uploads_dir.join(format!("{upload_id}.json"));
 
-//     let parent = state.object_path(&bucket, &key).parent().unwrap().to_path_buf();
-//     let safe_key = key.replace('/', "_");
-//     let meta_marker = parent.join(format!(".s3meta.{}", safe_key));
+    let marker = MultipartUploadMarker {
+        key: key.clone(),
+        owner: user.0.username.clone(),
+        upload_id: upload_id.clone(),
+        initiated: s3_now(),
+        part_etags: HashMap::new(),
+        part_sizes: HashMap::new(),
+        part_count: 0,
+    };
+    let data = serde_json::to_vec(&marker).map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    set(&marker_path, "s3.upload", &data).await?;
 
-//     // 2. Load bucket meta
-//     let bucket_meta_path = bucket_path.join(".s3meta");
-//     let bucket_meta = load_bucket_meta(&bucket_meta_path).await?;
+    // WAL entry for initiation (optional, useful for replay/cleanup)
+    let idx = state.get_bucket_index(&bucket).await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(format!("open index: {e}"))))?;
+    idx.put(IndexEntry {
+        key: format!("{key}"),
+        size: 0,
+        etag: "".into(),
+        last_modified: marker.initiated.clone(),
+        seq_no: 0,
+        is_delete: false,
+        version: Some(upload_id.clone()),
+    }).await.map_err(|e| AppError::Internal(anyhow::anyhow!(format!("index put: {e}"))))?;
 
-//     let versioning = bucket_meta.versioning;
+    // ────────────────────────────────
+    // SECTION 2: Response
+    // ────────────────────────────────
+    let xml = format!(
+        "<InitiateMultipartUploadResult>\
+            <Bucket>{}</Bucket>\
+            <Key>{}</Key>\
+            <UploadId>{}</UploadId>\
+        </InitiateMultipartUploadResult>",
+        bucket, key, upload_id
+    );
+    let mut headers = S3Headers::xml_headers();
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from_str(&xml.len().to_string()).unwrap());
+    Ok((StatusCode::OK, headers, xml))
+}
 
-//     // 3. Load object meta
-//     let mut obj_meta: ObjectMeta = get(&meta_marker, "user.s3.meta")
-//         .ok()
-//         .flatten()
-//         .and_then(|b| String::from_utf8(b).ok())
-//         .and_then(|s| serde_json::from_str(&s).ok())
-//         .unwrap_or_else(|| ObjectMeta::new(&user.0.username));
 
-//     // 4. If versioning → create delete marker
-//     if versioning {
-//         let next_version = obj_meta.current_version + 1;
-//         let marker_path = parent.join(format!("{}.v{}", key, next_version));
 
-//         // Create empty file (delete marker)
-//         fs::write(&marker_path, b"").await.context("create delete marker")?;
+pub async fn upload_part(
+    State(state): State<Arc<AppState>>,
+    AxumPath((bucket, key)): AxumPath<(String, String)>,
+    Query(params): Query<UploadPartQuery>,
+    user: Extension<AuthenticatedUser>,
+    req: Request<Body>,   // full Request
+) -> Result<(StatusCode, HeaderMap), AppError> {
+    // ────────────────────────────────
+    // SECTION 0: Validation + AuthZ
+    // ────────────────────────────────
+    validate_bucket(&bucket)?;
+    validate_key(&key)?;
+    if params.partNumber == 0 {
+        return Err(AppError::BadRequest("partNumber must be >= 1".into()));
+    }
 
-//         // Update metadata
-//         obj_meta.current_version = next_version;
-//         obj_meta.version_id = Some(next_version);
-//         obj_meta.is_delete_marker = true;
-//         obj_meta.etag = "\"delete-marker\"".to_string();
-//         obj_meta.content_type = "application/octet-stream".to_string();
+    let allowed = check_bucket_permission(&state.pool, &user.0, &bucket, PermissionLevel::ReadWrite.as_str())
+        .await.map_err(AppError::Internal)?;
+    if !allowed {
+        return Err(AppError::AccessDenied);
+    }
 
-//         let json = serde_json::to_string_pretty(&obj_meta).context("serialize obj meta")?;
-//         set(&meta_marker, "user.s3.meta", json.as_bytes())
-//             .map_err(|e| AppError::Internal(anyhow::anyhow!("save meta: {e}")))?;
+    // Concurrency budget + lock per (bucket/key/uploadId)
+    let _permit = state.io_budget.acquire().await.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    let _guard = state.io_locks.lock(format!("{}/{}/{}", bucket, key, params.uploadId)).await;
 
-//         // Update bucket stats
-//         let mut bucket_meta = bucket_meta;
-//         bucket_meta.used_bytes += 0; // empty file
-//         save_bucket_meta(&bucket_meta_path, &bucket_meta).await?;
+    // ────────────────────────────────
+    // SECTION 1: Split request into headers + body
+    // ────────────────────────────────
+    let (parts, body) = req.into_parts();
+    let headers = parts.headers;
+    let mut stream = BodyStream::new(body);
 
-//         let mut headers = S3Headers::common_headers();
-//         headers.insert("x-amz-version-id", next_version.to_string().parse().unwrap());
-//         headers.insert("x-amz-delete-marker", "true".parse().unwrap());
+    // Resolve marker and part path
+    let bucket_path = state.bucket_path(&bucket);
+    let uploads_dir = bucket_path.join(".s3uploads");
+    let marker_path = uploads_dir.join(format!("{}.json", params.uploadId));
+    let marker_json = get(&marker_path, "s3.upload").await?.ok_or(AppError::NoSuchUpload)?;
+    let mut marker: MultipartUploadMarker = serde_json::from_slice(&marker_json)
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(format!("bad marker: {e}"))))?;
+    if marker.key != key {
+        return Err(AppError::BadRequest("uploadId does not match key".into()));
+    }
 
-//         return Ok((StatusCode::NO_CONTENT, headers));
-//     }
+    let parts_dir = uploads_dir.join(&params.uploadId);
+    fs::create_dir_all(&parts_dir).await.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    let part_path = parts_dir.join(format!("part-{:010}.tmp", params.partNumber));
 
-//     // 5. Non-versioned: actually delete
-//     let base_path = state.object_path(&bucket, &key);
-//     if base_path.exists() {
-//         fs::remove_file(&base_path).await.context("delete file")?;
-//     }
+    // ────────────────────────────────
+    // SECTION 2: Stream write + checksum
+    // ────────────────────────────────
+    let dst_file = fs::File::create(&part_path).await.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    let mut writer = ChecksumWriter::new(tokio::io::BufWriter::with_capacity(8 * 1024 * 1024, dst_file));
+    let mut total_size = 0u64;
 
-//     // Remove metadata
-//     if meta_marker.exists() {
-//         fs::remove_file(&meta_marker).await.ok();
-//     }
+    while let Some(frame) = stream.next().await {
+        let frame = frame.map_err(|e| AppError::Internal(anyhow::anyhow!(format!("read body: {e}"))))?;
+        if let Some(data) = frame.data_ref() {
+            writer.write_all(data).await
+                .map_err(|e| AppError::Internal(anyhow::anyhow!(format!("write part: {e}"))))?;
+            total_size += data.len() as u64;
+        }
+    }
 
-//     // Update bucket stats
-//     let size = if base_path.exists() { fs::metadata(&base_path).await?.len() } else { 0 };
-//     let mut bucket_meta = bucket_meta;
-//     bucket_meta.object_count = bucket_meta.object_count.saturating_sub(1);
-//     bucket_meta.used_bytes = bucket_meta.used_bytes.saturating_sub(size);
-//     save_bucket_meta(&bucket_meta_path, &bucket_meta).await?;
+    if state.durability_enabled() {
+        writer.flush_and_sync().await?;
+    } else {
+        writer.flush().await.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    }
+    let (md5_bytes, _, _) = writer.finalize();
+    let etag = format!("\"{}\"", hex::encode(&md5_bytes));
 
-//     Ok((StatusCode::NO_CONTENT, HeaderMap::new()))
-// }
+    // ────────────────────────────────
+    // SECTION 2b: Validate Content-MD5 header (if present)
+    // ────────────────────────────────
+    if let Some(content_md5) = headers.get("Content-MD5") {
+        let provided = content_md5.to_str().map_err(|_| AppError::BadRequest("invalid Content-MD5 header".into()))?;
+        let expected = BASE64.encode(&md5_bytes);
+        if provided != expected {
+            return Err(AppError::BadDigest(format!(
+                "Content-MD5 mismatch: expected {}, got {}",
+                expected, provided
+            )));
+        }
+    }
+
+    // ────────────────────────────────
+    // SECTION 3: Update marker + WAL
+    // ────────────────────────────────
+    marker.part_etags.insert(params.partNumber, etag.clone());
+    marker.part_sizes.insert(params.partNumber, total_size);
+    marker.part_count = marker.part_etags.len() as u32;
+
+    let updated = serde_json::to_vec(&marker).map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    set(&marker_path, "s3.upload", &updated).await?;
+
+    let idx = state.get_bucket_index(&bucket).await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(format!("open index: {e}"))))?;
+    idx.put(IndexEntry {
+        key: format!("{}:part-{}", key, params.partNumber),
+        size: total_size,
+        etag: etag.clone(),
+        last_modified: s3_now(),
+        seq_no: 0,
+        is_delete: false,
+        version: Some(params.uploadId.clone()),
+    }).await.map_err(|e| AppError::Internal(anyhow::anyhow!(format!("index put: {e}"))))?;
+
+    // ────────────────────────────────
+    // SECTION 4: Response
+    // ────────────────────────────────
+    let mut headers = S3Headers::common_headers();
+    headers.insert(header::ETAG, HeaderValue::from_str(&etag).unwrap());
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+    Ok((StatusCode::OK, headers))
+}
+
+pub async fn complete_multipart_upload(
+    State(state): State<Arc<AppState>>,
+    AxumPath((bucket, key)): AxumPath<(String, String)>,
+    Query(params): Query<CompleteUploadQuery>, // { uploadId }
+    user: Extension<AuthenticatedUser>,
+    xml_body: Bytes,            // XML with <Part><PartNumber>..</PartNumber><ETag>..</ETag></Part>*
+) -> Result<(StatusCode, HeaderMap, String), AppError> {
+    // ────────────────────────────────
+    // SECTION 0: Validation + AuthZ + Locks
+    // ────────────────────────────────
+    validate_bucket(&bucket)?;
+    validate_key(&key)?;
+    let allowed = check_bucket_permission(&state.pool, &user.0, &bucket, PermissionLevel::ReadWrite.as_str())
+        .await.map_err(AppError::Internal)?;
+    if !allowed {
+        return Err(AppError::AccessDenied);
+    }
+    let _permit = state.io_budget.acquire().await.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    let _guard = state.io_locks.lock(format!("{}/{}/{}", bucket, key, params.uploadId)).await;
+
+    // ────────────────────────────────
+    // SECTION 1: Load marker + client XML parts
+    // ────────────────────────────────
+    #[derive(Debug, Clone, Deserialize)]
+    struct XmlPart {
+        #[serde(rename = "PartNumber")]
+        part_number: u32,
+        #[serde(rename = "ETag")]
+        etag: String,
+    }
+    #[derive(Debug, Clone, Deserialize)]
+    struct CompleteMultipartUpload {
+        #[serde(rename = "Part")]
+        parts: Vec<XmlPart>,
+    }
+
+    let bucket_path = state.bucket_path(&bucket);
+    let uploads_dir = bucket_path.join(".s3uploads");
+    let marker_path = uploads_dir.join(format!("{}.json", params.uploadId));
+    let marker_json = get(&marker_path, "s3.upload").await?.ok_or(AppError::NoSuchUpload)?;
+    let marker: MultipartUploadMarker = serde_json::from_slice(&marker_json)
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(format!("bad marker: {e}"))))?;
+    if marker.key != key {
+        return Err(AppError::BadRequest("uploadId does not match key".into()));
+    }
+
+    // Parse client XML body
+    let client: CompleteMultipartUpload = quick_xml::de::from_reader(xml_body.as_ref())
+        .map_err(|e| AppError::BadRequest(format!("invalid CompleteMultipartUpload XML: {e}")))?;
+
+    if client.parts.is_empty() {
+        return Err(AppError::BadRequest("no parts in CompleteMultipartUpload".into()));
+    }
+
+    // Validate ascending order and presence
+    let mut part_numbers: Vec<u32> = client.parts.iter().map(|p| p.part_number).collect();
+    let mut sorted = part_numbers.clone();
+    sorted.sort_unstable();
+    if part_numbers != sorted {
+        return Err(AppError::BadRequest("parts must be in ascending PartNumber order".into()));
+    }
+
+    // Validate each part exists in marker and ETag matches
+    for p in &client.parts {
+        let expected = marker.part_etags.get(&p.part_number)
+            .ok_or_else(|| AppError::BadRequest(format!("missing uploaded part {}", p.part_number)))?;
+        let expected_clean = expected.trim_matches('"');
+        let provided_clean = p.etag.trim().trim_matches('"');
+        if expected_clean != provided_clean {
+            return Err(AppError::BadRequest(format!(
+                "etag mismatch for part {}: expected {}, got {}",
+                p.part_number, expected_clean, provided_clean
+            )));
+        }
+    }
+
+    // ────────────────────────────────
+    // SECTION 2: Concatenate parts into final object
+    // ────────────────────────────────
+    let final_path = state.object_path(&bucket, &key);
+    let parent = final_path.parent().ok_or_else(|| AppError::BadRequest("invalid dst path".into()))?.to_path_buf();
+    fs::create_dir_all(&parent).await.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+
+    let safe_key = encode_token(&key);
+    let tmp_path = parent.join(format!("{}.{}.tmp", safe_key, Uuid::new_v4()));
+    let dst_file = fs::File::create(&tmp_path).await.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    let mut writer = ChecksumWriter::new(tokio::io::BufWriter::with_capacity(8 * 1024 * 1024, dst_file));
+
+    let parts_dir = uploads_dir.join(&params.uploadId);
+    let mut total_size = 0u64;
+    let mut buf = vec![0u8; 1024 * 1024];
+
+    for pn in &sorted {
+        let p = parts_dir.join(format!("part-{:010}.tmp", pn));
+        let mut f = fs::File::open(&p).await
+            .map_err(|e| AppError::Internal(anyhow::anyhow!(format!("open part {}: {e}", pn))))?;
+        loop {
+            let n = f.read(&mut buf).await
+                .map_err(|e| AppError::Internal(anyhow::anyhow!(format!("read part {}: {e}", pn))))?;
+            if n == 0 { break; }
+            writer.write_all(&buf[..n]).await
+                .map_err(|e| AppError::Internal(anyhow::anyhow!(format!("write final: {e}"))))?;
+            total_size += n as u64;
+        }
+    }
+
+    if state.durability_enabled() {
+        writer.flush_and_sync().await?;
+    } else {
+        writer.flush().await.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    }
+    // We compute and keep the file checksums internally but S3-style ETag is not plain MD5 for multipart
+    let (_md5_bytes_unused, _, _) = writer.finalize();
+
+    // ────────────────────────────────
+    // SECTION 2b: S3-style multipart ETag calculation ("<md5sum>-N")
+    // ────────────────────────────────
+    let mut md5_concat = Vec::new();
+    for pn in &sorted {
+        let et = marker.part_etags.get(pn).unwrap();
+        let raw = et.trim_matches('"');
+        let bytes = hex::decode(raw)
+            .map_err(|e| AppError::Internal(anyhow::anyhow!(format!("bad etag hex for part {}: {e}", pn))))?;
+        md5_concat.extend_from_slice(&bytes);
+    }
+    let multipart_md5 = md5::compute(&md5_concat);
+    let etag = format!("\"{}-{}\"", hex::encode(multipart_md5.0), sorted.len());
+
+    // ────────────────────────────────
+    // SECTION 3: Metadata + bucket stats + atomic rename
+    // ────────────────────────────────
+    let mut obj_meta = ObjectMeta::new(&user.0.username);
+    obj_meta.etag = etag.clone();
+    obj_meta.is_delete_marker = false;
+    obj_meta.version_id = None; // optionally assign if bucket versioning is enabled
+
+    // Bucket meta
+    let mut bucket_meta = load_bucket_meta(&bucket_path).await?;
+    let existed = fs::metadata(&final_path).await.is_ok();
+    if !existed {
+        bucket_meta.object_count = bucket_meta.object_count.saturating_add(1);
+        bucket_meta.used_bytes = bucket_meta.used_bytes.saturating_add(total_size);
+    } else {
+        let old_size = fs::metadata(&final_path).await.map(|m| m.len()).unwrap_or(0);
+        if total_size >= old_size {
+            bucket_meta.used_bytes = bucket_meta.used_bytes.saturating_add(total_size - old_size);
+        } else {
+            bucket_meta.used_bytes = bucket_meta.used_bytes.saturating_sub(old_size - total_size);
+        }
+    }
+
+    atomic_rename(&tmp_path, &final_path, state.durability_enabled()).await?;
+
+    let meta_marker = parent.join(format!(".s3meta.{safe_key}"));
+    save_object_meta(&meta_marker, &obj_meta, state.durability_enabled()).await?;
+    save_bucket_meta(&bucket_path, &bucket_meta, state.durability_enabled()).await?;
+
+    // ────────────────────────────────
+    // SECTION 4: WAL index update
+    // ────────────────────────────────
+    let idx = state.get_bucket_index(&bucket).await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(format!("open index: {e}"))))?;
+    idx.put(IndexEntry {
+        key: key.clone(),
+        size: total_size,
+        etag: etag.clone(),
+        last_modified: s3_now(),
+        seq_no: 0,            // assigned internally
+        is_delete: false,
+        version: Some(params.uploadId.clone()),
+    }).await.map_err(|e| AppError::Internal(anyhow::anyhow!(format!("index put: {e}"))))?;
+    if state.durability_enabled() {
+        if let Err(e) = idx.compact().await {
+            tracing::warn!("index compact after complete failed: {}", e);
+        }
+    }
+
+    // ────────────────────────────────
+    // SECTION 5: Cleanup temp parts + marker
+    // ────────────────────────────────
+    let _ = fs::remove_dir_all(&parts_dir).await;
+    let _ = fs::remove_file(&marker_path).await;
+
+    // ────────────────────────────────
+    // SECTION 6: Response
+    // ────────────────────────────────
+    let xml = format!(
+        "<CompleteMultipartUploadResult>\
+            <Bucket>{}</Bucket>\
+            <Key>{}</Key>\
+            <ETag>{}</ETag>\
+        </CompleteMultipartUploadResult>",
+        bucket, key, etag
+    );
+    let mut headers = S3Headers::xml_headers();
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from_str(&xml.len().to_string()).unwrap());
+    headers.insert(header::ETAG, HeaderValue::from_str(&etag).unwrap());
+    Ok((StatusCode::OK, headers, xml))
+}
+
+
+
+
+pub async fn abort_multipart_upload(
+    State(state): State<Arc<AppState>>,
+    AxumPath((bucket, key)): AxumPath<(String, String)>,
+    Query(params): Query<AbortUploadQuery>,
+    user: Extension<AuthenticatedUser>,
+) -> Result<(StatusCode, HeaderMap), AppError> {
+    // ────────────────────────────────
+    // SECTION 0: Validation + AuthZ + Lock
+    // ────────────────────────────────
+    validate_bucket(&bucket)?;
+    validate_key(&key)?;
+    let allowed = check_bucket_permission(&state.pool, &user.0, &bucket, PermissionLevel::ReadWrite.as_str())
+        .await.map_err(AppError::Internal)?;
+    if !allowed {
+        return Err(AppError::AccessDenied);
+    }
+    let _permit = state.io_budget.acquire().await.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    let _guard = state.io_locks.lock(format!("{}/{}/{}", bucket, key, params.uploadId)).await;
+
+    // ────────────────────────────────
+    // SECTION 1: Paths + marker
+    // ────────────────────────────────
+    let bucket_path = state.bucket_path(&bucket);
+    let uploads_dir = bucket_path.join(".s3uploads");
+    let marker_path = uploads_dir.join(format!("{}.json", params.uploadId));
+    if get(&marker_path, "s3.upload").await?.is_none() {
+        return Err(AppError::NoSuchUpload);
+    }
+
+    let parts_dir = uploads_dir.join(&params.uploadId);
+
+    // ────────────────────────────────
+    // SECTION 2: Cleanup parts + marker
+    // ────────────────────────────────
+    let _ = fs::remove_dir_all(&parts_dir).await;
+    let _ = fs::remove_file(&marker_path).await;
+
+    // WAL tombstone entry for aborted upload (optional)
+    let idx = state.get_bucket_index(&bucket).await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(format!("open index: {e}"))))?;
+    idx.put(IndexEntry {
+        key: key.clone(),
+        size: 0,
+        etag: "".into(),
+        last_modified: s3_now(),
+        seq_no: 0,
+        is_delete: true,
+        version: Some(params.uploadId.clone()),
+    }).await.map_err(|e| AppError::Internal(anyhow::anyhow!(format!("index tombstone: {e}"))))?;
+
+    // ────────────────────────────────
+    // SECTION 3: Response
+    // ────────────────────────────────
+    let mut headers = S3Headers::common_headers();
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+    Ok((StatusCode::NO_CONTENT, headers))
+}

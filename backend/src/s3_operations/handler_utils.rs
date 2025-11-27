@@ -242,6 +242,8 @@ pub enum AppError {
     BucketNotEmpty,
     #[error("No such key")]
     NoSuchKey,
+    #[error("No such upload")]
+    NoSuchUpload,
     #[error("Invalid bucket name: {0}")]
     InvalidBucketName(String),
     #[error("Invalid argument: {0}")]
@@ -250,6 +252,14 @@ pub enum AppError {
     PreconditionFailed,
     #[error("Entity too large")]
     EntityTooLarge,
+    #[error("Bad request: {0}")]
+    BadRequest(String),
+    /// S3: Content-MD5 mismatch
+    #[error("BadDigest: {0}")]
+    BadDigest(String),
+    /// S3: XAmzContentSHA256Mismatch
+    #[error("XAmzContentSHA256Mismatch")]
+    Sha256Mismatch,
     
 }
 
@@ -282,6 +292,10 @@ impl IntoResponse for AppError {
                 StatusCode::NOT_FOUND,
                 S3Error::no_such_key("key")
             ),
+            AppError::NoSuchUpload => ( // <-- added handler
+                StatusCode::NOT_FOUND,
+                S3Error::new("NoSuchUpload", "The specified upload does not exist.", "upload")
+            ),
             AppError::AccessDenied => (
                 StatusCode::FORBIDDEN,
                 S3Error::access_denied("resource")
@@ -301,6 +315,18 @@ impl IntoResponse for AppError {
             AppError::EntityTooLarge => (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 S3Error::new("EntityTooLarge", "The object is too large", "resource"),
+            ),
+            AppError::BadRequest(msg) => (
+                StatusCode::BAD_REQUEST,
+                S3Error::new("BadRequest", &msg, "request")
+            ),
+            AppError::BadDigest(msg) => (
+                StatusCode::BAD_REQUEST,
+                S3Error::new("BadDigest", &msg, "object"),
+            ),
+            AppError::Sha256Mismatch => (
+                StatusCode::BAD_REQUEST,
+                S3Error::new("XAmzContentSHA256Mismatch", "The SHA256 checksum did not match", "object"),
             ),
             AppError::Internal(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,

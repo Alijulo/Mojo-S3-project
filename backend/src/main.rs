@@ -38,11 +38,14 @@ use s3_operations::object_handlers::{
     delete_object, get_object, head_object, list_objects, put_object,presign_object
 };
 use s3_operations::handler_utils::{S3Headers};
+use s3_operations::background_workers::{
+    BackgroundWorkers,spawn_fsync_worker,spawn_archive_copy_worker,spawn_bucket_meta_worker};
 use s3_operations::auth::auth_middleware;
 use s3_operations::user_models::{initialize_database, verify_credentials};
 use s3_operations::jwt_utils::generate_jwt;
-use s3_operations::store;
+use s3_operations::{store,index};
 use store::{ClusterStore, LocalStore, ObjectStore};
+use index::BucketIndex;
 // --- Shared XML response structs ---
 use serde::{Deserialize, Serialize};
 use quick_xml::se::to_string as to_xml_string;
@@ -52,34 +55,6 @@ static GLOBAL_IO_SEMAPHORE: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(32));
 // --- Shared S3-Standard XML Response Structs ---
 pub const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
-// // --- Per-key async locks ---
-// #[derive(Default)]
-// pub struct IoLocks {
-//     locks: DashMap<String, Arc<Mutex<()>>>,
-// }
-// impl IoLocks {
-//     pub fn new() -> Self {
-//         Self {
-//             locks: DashMap::new(),
-//         }
-//     }
-//     pub async fn lock(&self, key: String) -> tokio::sync::MutexGuard<'_, ()> {
-//         let entry = self
-//             .locks
-//             .entry(key)
-//             .or_insert_with(|| Arc::new(Mutex::new(())));
-//         entry.value().lock().await
-//     }
-// }
-
-// // --- Application State ---
-// #[derive(Clone)]
-// pub struct AppState {
-//     pub storage_root: PathBuf,
-//     pub pool: SqlitePool,
-//     pub store: Arc<dyn ObjectStore>,
-//     pub io_locks: Arc<IoLocks>,
-// }
 
 
 // --- Per-key async locks ---
@@ -103,6 +78,23 @@ impl IoLocks {
     }
 }
 
+// Configurable durability level
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DurabilityLevel {
+    Strong,   // fsyncs enabled
+    Relaxed,  // rely on background periodic fsync/repair
+}
+
+impl DurabilityLevel {
+    pub fn from_env() -> Self {
+        match std::env::var("DURABILITY_LEVEL").as_deref() {
+            Ok("RELAXED") => DurabilityLevel::Relaxed,
+            _ => DurabilityLevel::Strong,
+        }
+    }
+}
+
+
 // --- Application State ---
 #[derive(Clone)]
 pub struct AppState {
@@ -111,6 +103,10 @@ pub struct AppState {
     pub store: Arc<dyn ObjectStore>,
     pub io_locks: Arc<IoLocks>,
     pub io_budget: Arc<Semaphore>, // global I/O concurrency budget
+    pub durability: DurabilityLevel,              // NEW: durability mode
+    pub workers: Option<BackgroundWorkers>,       // NEW: background workers
+    //per-bucket indexes
+    pub indexes: Arc<DashMap<String, Arc<BucketIndex>>>,
 }
 
 impl AppState {
@@ -120,6 +116,18 @@ impl AppState {
     }
     pub fn bucket_path(&self, bucket: &str) -> PathBuf {
         self.storage_root.join(bucket)
+    }
+    pub async fn get_bucket_index(&self, bucket: &str) -> Result<Arc<BucketIndex>> {
+        if let Some(idx) = self.indexes.get(bucket) {
+            return Ok(idx.clone());
+        }
+
+        // Lazily open/create index if not cached
+        let base = self.bucket_path(bucket);
+        let idx = BucketIndex::open(bucket, &base).await?;
+        let arc_idx = Arc::new(idx);
+        self.indexes.insert(bucket.to_string(), arc_idx.clone());
+        Ok(arc_idx)
     }
 }
 
@@ -249,6 +257,26 @@ async fn main() -> Result<()> {
         .unwrap_or(64); // default concurrency limit
     let io_budget = Arc::new(Semaphore::new(io_budget_permits));
 
+    // --- Durability mode ---
+    let durability = DurabilityLevel::from_env();
+
+    // --- Background worker channels ---
+    let (bucket_meta_tx, bucket_meta_rx) = tokio::sync::mpsc::channel(100);
+    let (fsync_tx, fsync_rx) = tokio::sync::mpsc::channel(100);
+    let (archive_copy_tx, archive_copy_rx) = tokio::sync::mpsc::channel(100);
+
+    // Spawn workers
+    spawn_bucket_meta_worker(bucket_meta_rx, storage_root.clone(), durability);
+    spawn_fsync_worker(fsync_rx);
+    spawn_archive_copy_worker(archive_copy_rx);
+
+    let workers = BackgroundWorkers {
+        bucket_meta_tx,
+        fsync_tx,
+        archive_copy_tx,
+    };
+
+
     // --- Application State ---
     let state = Arc::new(AppState {
         storage_root,
@@ -256,6 +284,9 @@ async fn main() -> Result<()> {
         store,
         io_locks: Arc::new(IoLocks::new()),
         io_budget, // NEW field
+        durability,                // NEW
+        workers: Some(workers),
+        indexes: Arc::new(DashMap::new()),
     });
 
     // CORS

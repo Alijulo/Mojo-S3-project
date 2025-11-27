@@ -8,3 +8,5 @@ pub mod authextractor;
 pub mod metadata;
 pub mod test;
 pub mod store;
+pub mod background_workers;
+pub mod index;
