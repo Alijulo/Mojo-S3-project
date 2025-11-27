@@ -670,7 +670,7 @@ pub async fn get_bucket_policy(
     Ok((headers, policy_str))
 }
 
-//Deelete bucket
+//Delete bucket
 pub async fn delete_bucket_policy(
     State(state): State<Arc<AppState>>,
     AxumPath(bucket): AxumPath<String>,

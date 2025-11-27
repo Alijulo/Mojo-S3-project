@@ -583,51 +583,54 @@ fn spawn_incomplete_marker(parent: &Path, base_name: &std::ffi::OsStr) {
 
 /// A durable commit that sequences file flush+sync → rename → dir fsyncs → meta → bucket → index.
 /// If any post-rename step fails, writes an "incomplete" marker and returns an error, allowing repair.
+/// A durable commit that sequences file flush+sync → rename → dir fsyncs → meta → bucket → index.
+/// If any post-rename step fails, writes an "incomplete" marker and returns an error, allowing repair.
 pub async fn commit_object_transaction(
     state: &AppState,
     tmp_path: &Path,
     final_path: &Path,
     parent_dir: &Path,
-    meta_marker: &Path,
+    safe_key: &str,
     obj_meta: &ObjectMeta,
     bucket_path: &Path,
     bucket_meta: &BucketMeta,
-    bucket_index: &Arc<BucketIndex>, // <-- change type here
+    bucket_index: &Arc<BucketIndex>,
+    object_size: u64,            // <-- explicit object size for index
 ) -> Result<(), AppError> {
-    // ────────────────────────────────
-    // Step 1: Rename + fsyncs
-    // ────────────────────────────────
+    // Step 1: Atomic rename
+    tracing::info!(tmp=?tmp_path, final=?final_path, "commit: starting atomic rename");
     atomic_rename(tmp_path, final_path, state.durability_enabled()).await?;
 
-    // ────────────────────────────────
-    // Step 2: Write object metadata
-    // ────────────────────────────────
-    save_object_meta(meta_marker, obj_meta, state.durability_enabled()).await
+    // Step 2: Object metadata sidecar write
+    let marker = bucket_path.join(format!(".s3meta.{}", safe_key));
+    tracing::info!(marker=?final_path, "commit: writing object metadata sidecar");
+    save_object_meta(&marker, obj_meta, state.durability_enabled())
+        .await
         .map_err(|e| {
+            tracing::error!(error=?e, marker=?final_path, "commit: failed to write object metadata");
             let _ = mark_incomplete(final_path, parent_dir);
             e
         })?;
 
-    // ────────────────────────────────
-    // Step 3: Bucket meta
-    // ────────────────────────────────
-    save_bucket_meta(bucket_path, bucket_meta, state.durability_enabled()).await
+    // Step 3: Bucket meta update (durable)
+    tracing::info!(bucket=?bucket_path, "commit: updating bucket meta");
+    save_bucket_meta(bucket_path, bucket_meta, state.durability_enabled())
+        .await
         .map_err(|e| {
+            tracing::info!(error=?e, bucket=?bucket_path, "commit: failed to update bucket meta");
             let _ = mark_incomplete(final_path, parent_dir);
             e
         })?;
 
-    // ────────────────────────────────
-    // Step 4: WAL Index update
-    // ────────────────────────────────
-    // Build entry from obj_meta
-    use chrono::Utc;
+    // Step 4: WAL index update
+    use chrono::{DateTime, Utc};
     let last_modified = DateTime::<Utc>::from(std::time::SystemTime::now())
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
     let entry = IndexEntry {
+        // Use logical S3 key, not file name
         key: final_path.file_name().unwrap().to_string_lossy().to_string(),
-        size: bucket_meta.used_bytes, // or obj size if tracked separately
+        size: object_size,
         etag: obj_meta.etag.clone(),
         last_modified,
         seq_no: 0, // assigned inside BucketIndex
@@ -635,8 +638,11 @@ pub async fn commit_object_transaction(
         version: obj_meta.version_id.clone(),
     };
 
+    let key_for_log = entry.key.clone();
+
     bucket_index.put(entry).await
         .map_err(|e| {
+            tracing::error!(error=?e, key=?key_for_log, "commit: failed to put index entry");
             let _ = mark_incomplete(final_path, parent_dir);
             AppError::Internal(anyhow::anyhow!(format!("index put: {e}")))
         })?;
@@ -649,6 +655,7 @@ pub async fn commit_object_transaction(
 
     Ok(())
 }
+
 
 
 /// Write a small sidecar marker indicating incomplete state for repair tools.
@@ -760,7 +767,9 @@ pub async fn put_object(
         hasher.update(key.as_bytes());
         format!("sha256-{}", hex::encode(hasher.finalize()))
     };
-    let meta_marker = parent.join(format!(".s3meta.{safe_key}"));
+    //let meta_marker = parent.join(format!(".s3meta.{safe_key}"));
+    let meta_marker = key.replace('/', "_");
+    //let safe_key = key.replace('/', "_");
 
     let mut obj_meta = load_object_meta(&parent, &safe_key)
         .await
@@ -942,24 +951,8 @@ pub async fn put_object(
     }
 
     // ────────────────────────────────
-    // SECTION 11: Atomic Rename
+    // SECTION 11: Prepare metadata and bucket meta deltas
     // ────────────────────────────────
-    atomic_rename(&tmp_path, &base_path, state.durability_enabled()).await?;
-
-    // ────────────────────────────────
-    // SECTION 12: Post-rename Transactional Updates
-    // ────────────────────────────────
-    fn spawn_incomplete_marker(parent: &Path, base_name: &std::ffi::OsStr) {
-        let parent = parent.to_path_buf();
-        let base_name = base_name.to_owned();
-        let _ = tokio::spawn(async move {
-            let marker = parent.join(format!(".incomplete.{}", base_name.to_string_lossy()));
-            let _ = fs::write(&marker, b"post-rename failure").await;
-            fsync_dir(&parent).await;
-        });
-    }
-    let base_name = base_path.file_name().unwrap().to_owned();
-
     obj_meta.etag = etag.clone();
     obj_meta.content_type = content_type;
     obj_meta.owner = user.0.username.clone();
@@ -968,10 +961,6 @@ pub async fn put_object(
     obj_meta.tags = tags;
     obj_meta.version_id = new_version_id.clone();
 
-    save_object_meta(&meta_marker, &obj_meta, state.durability_enabled())
-        .await
-        .map_err(|e| { spawn_incomplete_marker(&parent, &base_name); e })?;
-
     if is_new_object {
         bucket_meta.object_count = bucket_meta.object_count.saturating_add(1);
     }
@@ -979,63 +968,37 @@ pub async fn put_object(
         bucket_meta.used_bytes = bucket_meta.used_bytes.saturating_add(total_size);
     } else {
         if total_size >= old_size {
-            bucket_meta.used_bytes =
-                bucket_meta.used_bytes.saturating_add(total_size - old_size);
+            bucket_meta.used_bytes = bucket_meta.used_bytes.saturating_add(total_size - old_size);
         } else {
-            bucket_meta.used_bytes =
-                bucket_meta.used_bytes.saturating_sub(old_size - total_size);
+            bucket_meta.used_bytes = bucket_meta.used_bytes.saturating_sub(old_size - total_size);
         }
     }
-    save_bucket_meta(&bucket_path, &bucket_meta, state.durability_enabled())
+
+    // ────────────────────────────────
+    // SECTION 12: Obtain WAL index and run atomic commit
+    // ────────────────────────────────
+    let idx = state.get_bucket_index(&bucket)
         .await
-        .map_err(|e| { spawn_incomplete_marker(&parent, &base_name); e })?;
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(format!("open index: {e}"))))?;
+
+    // Atomic commit: flush+sync already done; now rename → meta sidecar → bucket meta → WAL index
+    commit_object_transaction(
+        &state,
+        &tmp_path,
+        &base_path,
+        &parent,
+        &meta_marker,      // sidecar metadata path (.s3meta.<safe_key>)
+        &obj_meta,
+        &bucket_path,
+        &bucket_meta,
+        &idx,
+        total_size,        // explicit object size for index entry
+    ).await?;
 
     // ────────────────────────────────
-    // SECTION 13: Index Update + Metrics (WAL-backed)
+    // SECTION 13: Metrics
     // ────────────────────────────────
-    use chrono::{DateTime, Utc};
-    let last_modified = DateTime::<Utc>::from(std::time::SystemTime::now())
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-
-    let prefix = parent
-        .strip_prefix(&bucket_path)
-        .ok()
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_default();
-
-    // Prefix-level lock to serialize index updates
-    let _idx_guard = state.io_locks.lock(format!("idx:{}/{}", bucket, prefix)).await;
-
-    let index_entry = IndexEntry {
-        key: key.clone(),
-        size: total_size,
-        etag: etag.clone(),
-        last_modified: last_modified.clone(),
-        seq_no: 0, // assigned inside BucketIndex
-        is_delete: false,
-        version: new_version_id.clone(),
-    };
-
-    let idx = state.get_bucket_index(&bucket).await
-        .map_err(|e| {
-            spawn_incomplete_marker(&parent, &base_name);
-            AppError::Internal(anyhow::anyhow!(format!("open index: {e}")))
-        })?;
-
-    idx.put(index_entry).await
-        .map_err(|e| {
-            spawn_incomplete_marker(&parent, &base_name);
-            AppError::Internal(anyhow::anyhow!(format!("index put: {e}")))
-        })?;
-
-    if state.durability_enabled() {
-        if let Err(e) = idx.compact().await {
-            tracing::warn!(req_id, bucket=%bucket, key=%key, "index compact failed: {}", e);
-        }
-    }
-
     PUT_BYTES.fetch_add(total_size, std::sync::atomic::Ordering::Relaxed);
-
 
     // ────────────────────────────────
     // SECTION 14: Finalize + Response
@@ -1160,7 +1123,9 @@ pub async fn copy_object(
     let versioning = dst_bucket_meta.versioning;
     let dst_safe_key = encode_token(&dst_key);
     let src_safe_key = encode_token(&src_key);
-    let dst_meta_marker = dst_parent.join(format!(".s3meta.{dst_safe_key}"));
+
+    //let dst_meta_marker = dst_parent.join(format!(".s3meta.{dst_safe_key}"));
+    let dst_meta_marker = dst_key.replace('/', "_");
     let src_meta = load_object_meta(&src_base.parent().unwrap_or(&src_bucket_path), &src_safe_key)
         .await.unwrap_or_else(|_| ObjectMeta::new(&user.0.username));
 
@@ -1227,6 +1192,7 @@ pub async fn copy_object(
     let (md5_bytes, _sha256_bytes, _) = writer.finalize();
     let etag = format!("\"{}\"", hex::encode(&md5_bytes));
 
+
     // ────────────────────────────────
     // SECTION 9: Destination Meta + Bucket Stats
     // ────────────────────────────────
@@ -1237,13 +1203,16 @@ pub async fn copy_object(
     dst_obj_meta.is_delete_marker = false;
 
     let dst_existed = fs::metadata(&dst_base).await.is_ok();
+    let old_size = if dst_existed {
+        fs::metadata(&dst_base).await.map(|m| m.len()).unwrap_or(0)
+    } else { 0 };
+
     if !dst_existed {
         dst_bucket_meta.object_count = dst_bucket_meta.object_count.saturating_add(1);
     }
     if versioning {
         dst_bucket_meta.used_bytes = dst_bucket_meta.used_bytes.saturating_add(total_size);
     } else {
-        let old_size = fs::metadata(&dst_base).await.map(|m| m.len()).unwrap_or(0);
         if total_size >= old_size {
             dst_bucket_meta.used_bytes = dst_bucket_meta.used_bytes.saturating_add(total_size - old_size);
         } else {
@@ -1252,47 +1221,23 @@ pub async fn copy_object(
     }
 
     // ────────────────────────────────
-    // SECTION 10: WAL-backed Index Update
+    // SECTION 10: Transactional Commit (rename → meta → bucket → WAL index)
     // ────────────────────────────────
-    use chrono::Utc;
-    let last_modified = DateTime::<Utc>::from(std::time::SystemTime::now())
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-
-    let idx = state.get_bucket_index(&dst_bucket).await
+    let idx = state.get_bucket_index(&dst_bucket)
+        .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!(format!("open index: {e}"))))?;
 
-    let entry = IndexEntry {
-        key: dst_key.clone(),
-        size: total_size,
-        etag: etag.clone(),
-        last_modified,
-        seq_no: 0, // assigned inside BucketIndex
-        is_delete: false,
-        version: new_version_id.clone(),
-    };
-
-    idx.put(entry).await
-        .map_err(|e| AppError::Internal(anyhow::anyhow!(format!("index put: {e}"))))?;
-
-    if state.durability_enabled() {
-        if let Err(e) = idx.compact().await {
-            tracing::warn!(req_id, dst_bucket=%dst_bucket, dst_key=%dst_key, "index compact failed: {}", e);
-        }
-    }
-
-    // ────────────────────────────────
-    // SECTION 11: Transactional Commit
-    // ────────────────────────────────
     commit_object_transaction(
         &state,
-        &tmp_path,
-        &dst_base,
-        &dst_parent,
-        &dst_meta_marker,
-        &dst_obj_meta,
+        &tmp_path,          // temp file path
+        &dst_base,          // final destination object path
+        &dst_parent,        // parent dir for incomplete marker/fsync
+        &dst_meta_marker,   // destination sidecar .s3meta.<safe_key>
+        &dst_obj_meta,      // prepared destination metadata
         &dst_bucket_path,
         &dst_bucket_meta,
-        &idx, // WAL-backed index
+        &idx,               // WAL-backed index
+        total_size,         // explicit object size
     ).await?;
 
     // Mark temp guard committed only after successful transaction
@@ -1301,7 +1246,7 @@ pub async fn copy_object(
     PUT_BYTES.fetch_add(total_size, std::sync::atomic::Ordering::Relaxed);
 
     // ────────────────────────────────
-    // SECTION 12: Response
+    // SECTION 11: Response
     // ────────────────────────────────
     let mut resp_headers = S3Headers::common_headers();
     resp_headers.insert(
@@ -1401,50 +1346,167 @@ pub async fn get_object(
         .unwrap_or(false);
 
     // 5. Consult WAL-backed index first
+    // let idx = state.get_bucket_index(&bucket).await
+    //     .map_err(|e| AppError::Internal(anyhow!(format!("open index: {e}"))))?;
+    // match idx.get(&key).await {
+    //     GetResult::Deleted(_) => return Err(AppError::NoSuchKey),
+    //     GetResult::NotFound => return Err(AppError::NoSuchKey),
+    //     GetResult::Found(_entry) => {
+    //         // continue; we still load object_meta for content_type, tags, etc.
+    //     }
+    // }
+    // 5. Consult WAL-backed index first
     let idx = state.get_bucket_index(&bucket).await
         .map_err(|e| AppError::Internal(anyhow!(format!("open index: {e}"))))?;
+
     match idx.get(&key).await {
-        GetResult::Deleted(_) => return Err(AppError::NoSuchKey),
-        GetResult::NotFound => return Err(AppError::NoSuchKey),
-        GetResult::Found(_entry) => {
+        GetResult::Deleted(seq) => {
+            tracing::warn!(
+                bucket=%bucket,
+                key=%key,
+                seq_no=?seq,
+                "GET: object marked deleted in WAL index"
+            );
+            return Err(AppError::NoSuchKey);
+        }
+        GetResult::NotFound => {
+            tracing::warn!(
+                bucket=%bucket,
+                key=%key,
+                "GET: object not found in WAL index"
+            );
+            return Err(AppError::NoSuchKey);
+        }
+        GetResult::Found(entry) => {
+            tracing::info!(
+                bucket=%bucket,
+                key=%key,
+                etag=?entry.etag,
+                size=?entry.size,
+                version=?entry.version,
+                "GET: object found in WAL index"
+            );
             // continue; we still load object_meta for content_type, tags, etc.
         }
     }
+
 
     // 6. Load object metadata
     let obj_meta = load_object_meta(&parent, &safe_key).await?;
     let req_version = params.get("versionId").cloned();
 
+    // // 7. Version resolution
+    // let object_path = if versioning {
+    //     match (&req_version, obj_meta.version_id.clone(), obj_meta.is_delete_marker) {
+    //         (None, _, true) => return Err(AppError::NoSuchKey),
+    //         (Some(vid), Some(latest_vid), true) if &latest_vid == vid => return Err(AppError::NoSuchKey),
+    //         (Some(vid), Some(latest_vid), false) if &latest_vid == vid => full_key_path.clone(),
+    //         (Some(vid), _, _) => {
+    //             let archive_path = parent.join(".s3versions").join(&safe_key).join(vid);
+    //             if !archive_path.exists() {
+    //                 return Err(AppError::NotFound(format!("version {}", vid)));
+    //             }
+    //             archive_path
+    //         }
+    //         (None, _, false) => full_key_path.clone(),
+    //     }
+    // } else {
+    //     full_key_path.clone()
+    // };
+
     // 7. Version resolution
+    tracing::info!(
+        bucket=%bucket,
+        key=%key,
+        versioning=%versioning,
+        req_version=?req_version,
+        obj_version=?obj_meta.version_id,
+        delete_marker=?obj_meta.is_delete_marker,
+        "GET: starting version resolution"
+    );
+
     let object_path = if versioning {
         match (&req_version, obj_meta.version_id.clone(), obj_meta.is_delete_marker) {
-            (None, _, true) => return Err(AppError::NoSuchKey),
-            (Some(vid), Some(latest_vid), true) if &latest_vid == vid => return Err(AppError::NoSuchKey),
-            (Some(vid), Some(latest_vid), false) if &latest_vid == vid => full_key_path.clone(),
+            (None, _, true) => {
+                tracing::warn!(bucket=%bucket, key=%key, "GET: object has delete marker, returning NoSuchKey");
+                return Err(AppError::NoSuchKey);
+            }
+            (Some(vid), Some(latest_vid), true) if &latest_vid == vid => {
+                tracing::warn!(bucket=%bucket, key=%key, version=?vid, "GET: requested version is a delete marker, returning NoSuchKey");
+                return Err(AppError::NoSuchKey);
+            }
+            (Some(vid), Some(latest_vid), false) if &latest_vid == vid => {
+                tracing::info!(bucket=%bucket, key=%key, version=?vid, "GET: serving latest version");
+                full_key_path.clone()
+            }
             (Some(vid), _, _) => {
                 let archive_path = parent.join(".s3versions").join(&safe_key).join(vid);
                 if !archive_path.exists() {
+                    tracing::error!(bucket=%bucket, key=%key, version=?vid, path=?archive_path, "GET: requested version not found");
                     return Err(AppError::NotFound(format!("version {}", vid)));
                 }
+                tracing::info!(bucket=%bucket, key=%key, version=?vid, path=?archive_path, "GET: serving archived version");
                 archive_path
             }
-            (None, _, false) => full_key_path.clone(),
+            (None, _, false) => {
+                tracing::info!(bucket=%bucket, key=%key, "GET: serving current version");
+                full_key_path.clone()
+            }
         }
     } else {
+        tracing::info!(bucket=%bucket, key=%key, "GET: versioning disabled, serving current object");
         full_key_path.clone()
     };
 
+
     // 8. Open file
+    // let mut file = File::open(&object_path).await.map_err(|e| {
+    //     if e.kind() == std::io::ErrorKind::NotFound {
+    //         AppError::NoSuchKey
+    //     } else {
+    //         AppError::Io(e)
+    //     }
+    // }).context("open file")?;
+// 8. Open file
+    tracing::info!(
+        bucket=%bucket,
+        key=%key,
+        path=?object_path,
+        "GET: attempting to open object file"
+    );
+
     let mut file = File::open(&object_path).await.map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
+            tracing::error!(
+                bucket=%bucket,
+                key=%key,
+                path=?object_path,
+                "GET: object file not found"
+            );
             AppError::NoSuchKey
         } else {
+            tracing::error!(
+                bucket=%bucket,
+                key=%key,
+                path=?object_path,
+                error=?e,
+                "GET: failed to open object file"
+            );
             AppError::Io(e)
         }
-    })?;
+    }).context("open file")?;
+
     let file_meta = file.metadata().await.context("file metadata")?;
     let total_size = file_meta.len();
 
+    tracing::info!(
+        bucket=%bucket,
+        key=%key,
+        path=?object_path,
+        size=total_size,
+        modified=?file_meta.modified().ok(),
+        "GET: successfully opened object file"
+    );
     // 9. Conditional headers
     if let Some(if_none) = headers.get(axum::http::header::IF_NONE_MATCH).and_then(|h| h.to_str().ok()) {
         if if_none.split(',').any(|tag| tag.trim() == obj_meta.etag) {
