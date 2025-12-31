@@ -15,8 +15,14 @@ use chrono::{DateTime, Utc, Duration};
 use anyhow::{Context, Result};
 use crate::s3_operations::user_models::{verify_credentials, User};
 use crate::s3_operations::jwt_utils::validate_jwt;
-use crate::{AppError, AppState};
-
+use crate::{AppState};
+use crate::{
+    s3_operations::{handler_utils::AppError,metadata::{get},bucket_handlers::evaluate_bucket_policy},
+};
+use std::{path::PathBuf};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+use base64::{engine::general_purpose, Engine as _};
 // Constants for authentication prefixes
 const BEARER_PREFIX: &str = "Bearer ";
 const BASIC_PREFIX: &str = "Basic ";
@@ -357,6 +363,8 @@ pub async fn auth_middleware(
     }
 }
 
+
+
 pub async fn check_bucket_permission(
     pool: &SqlitePool,
     user: &AuthenticatedUser,
@@ -370,11 +378,13 @@ pub async fn check_bucket_permission(
         required_level
     );
 
+    // 1. Admin shortcut
     if user.role == "admin" {
         tracing::info!("Admin user {} granted full access to bucket {}", user.username, bucket);
         return Ok(true);
     }
 
+    // 2. DB ACL check
     let permission_level = sqlx::query_scalar::<_, String>(
         "SELECT permission_level FROM user_bucket_permissions 
          WHERE user_id = ? AND bucket_name = ?"
@@ -383,9 +393,12 @@ pub async fn check_bucket_permission(
     .bind(bucket)
     .fetch_optional(pool)
     .await
-    .context(format!("Failed to fetch bucket permission for user {} and bucket {}", user.username, bucket))?;
+    .context(format!(
+        "Failed to fetch bucket permission for user {} and bucket {}",
+        user.username, bucket
+    ))?;
 
-    let result = match (required_level, permission_level.as_deref()) {
+    let acl_result = match (required_level, permission_level.as_deref()) {
         (level, Some(perm)) if level == PermissionLevel::ReadOnly.as_str() => {
             perm == PermissionLevel::ReadOnly.as_str() || perm == PermissionLevel::ReadWrite.as_str()
         }
@@ -395,13 +408,71 @@ pub async fn check_bucket_permission(
         _ => false,
     };
 
+    // 3. Bucket policy check
+    let bucket_path = PathBuf::from("storage").join(bucket).join(".s3meta");
+    if let Some(policy_bytes) = get(bucket_path.to_str().unwrap(), "user.s3.policy").await.ok().flatten() {
+        if let Ok(policy_json) = serde_json::from_slice::<serde_json::Value>(&policy_bytes) {
+            let action = match required_level {
+                l if l == PermissionLevel::ReadOnly.as_str() => "s3:GetObject",
+                l if l == PermissionLevel::ReadWrite.as_str() => "s3:PutObject",
+                _ => "s3:Unknown",
+            };
+            let resource = format!("arn:aws:s3:::{bucket}/*");
+            let principal = &user.username;
+
+            let policy_result = evaluate_bucket_policy(&policy_json, action, &resource, principal);
+
+            tracing::info!(
+                "Policy evaluation for user {} on bucket {} action {}: {}",
+                user.username,
+                bucket,
+                action,
+                policy_result
+            );
+
+            // Deny overrides ACL
+            if !policy_result {
+                return Ok(false);
+            }
+            // Allow overrides ACL
+            if policy_result {
+                return Ok(true);
+            }
+        }
+    }
+
+    // 4. Fall back to ACL result
     tracing::info!(
-        "Permission check result for user {} on bucket {}: {}",
+        "Final permission result for user {} on bucket {}: {}",
         user.username,
         bucket,
-        result
+        acl_result
     );
-    Ok(result)
+    Ok(acl_result)
+}
+
+
+
+type HmacSha256 = Hmac<Sha256>;
+
+pub fn generate_presigned_url(
+    bucket: &str,
+    key: &str,
+    secret: &str,
+    expiry_secs: i64,
+) -> String {
+    let expires = Utc::now() + Duration::seconds(expiry_secs);
+    let expiry_ts = expires.timestamp();
+
+    let data = format!("{bucket}/{key}:{expiry_ts}");
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(data.as_bytes());
+    let signature = mac.finalize().into_bytes();
+    let sig_b64 = general_purpose::URL_SAFE_NO_PAD.encode(signature);
+
+    format!(
+        "/api/v1/object/{bucket}/{key}?expires={expiry_ts}&sig={sig_b64}"
+    )
 }
 
 
