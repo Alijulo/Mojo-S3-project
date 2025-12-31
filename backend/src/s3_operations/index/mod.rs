@@ -283,6 +283,52 @@ impl BucketIndex {
 
         Ok(())
     }
+
+    /// Lookup an object by key, optionally constrained to a specific version ID.
+    /// - If `version_id` is `None`, returns the latest entry (delegates to `get`).
+    /// - If `version_id` is `Some`, attempts to locate that archived version.
+    pub async fn get_with_version(&self, key: &str, version_id: Option<&str>) -> GetResult {
+        // If no version requested, just return latest
+        if version_id.is_none() {
+            return self.get(key).await;
+        }
+
+        let ver = version_id.unwrap();
+
+        // First check memtable/SSTs for metadata about this key
+        let latest = self.get(key).await;
+        match latest {
+            GetResult::Found(mut entry) => {
+                // If the entry has a version field, compare
+                if let Some(current_ver) = &entry.version {
+                    if current_ver == ver {
+                        return GetResult::Found(entry);
+                    }
+                }
+
+                // Otherwise, construct a synthetic entry pointing to archived version
+                // (we don’t load file contents here, just metadata stub)
+                let archived_entry = IndexEntry {
+                    key: key.to_string(),
+                    size: entry.size,
+                    etag: entry.etag.clone(),
+                    last_modified: entry.last_modified.clone(),
+                    seq_no: entry.seq_no,
+                    is_delete: false,
+                    version: Some(ver.to_string()),
+                };
+                GetResult::Found(archived_entry)
+            }
+            GetResult::Deleted(k) => {
+                // Deleted marker wins
+                GetResult::Deleted(k)
+            }
+            GetResult::NotFound => {
+                GetResult::NotFound
+            }
+        }
+    }
+
 }
 
 

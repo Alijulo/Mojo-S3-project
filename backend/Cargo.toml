@@ -28,7 +28,7 @@ http = "1.0"
 futures = "0.3"
 quick-xml = { version = "0.38.3", features = ["serialize"] }
 chrono = { version = "0.4", features = ["serde"] }
-tower-http = { version = "0.6.6", features = ["cors"] }
+tower-http = { version = "0.6.7", features = ["trace", "timeout", "compression-gzip", "cors"] }
 md5 = "0.8.0"
 hex = "0.4"
 sha2 = "0.10.9"
@@ -70,6 +70,7 @@ http-body-util = "0.1.3"
 pin-project = "1.1.10"
 winapi = { version = "0.3.9", features = ["winbase", "fileapi"] }
 memmap2 = "0.9.9"
+tower = "0.5.2"
 
 
 # Explicitly enable it for Unix targets

@@ -244,10 +244,14 @@ pub enum AppError {
     NoSuchKey,
     #[error("No such upload")]
     NoSuchUpload,
+    #[error("No such version")]
+    NoSuchVersion,
     #[error("Invalid bucket name: {0}")]
     InvalidBucketName(String),
     #[error("Invalid argument: {0}")]
     InvalidArgument(String),
+    #[error("Invalid range: {0}")]
+    InvalidRange(String),
     #[error("Precondition failed")]
     PreconditionFailed,
     #[error("Entity too large")]
@@ -292,9 +296,17 @@ impl IntoResponse for AppError {
                 StatusCode::NOT_FOUND,
                 S3Error::no_such_key("key")
             ),
-            AppError::NoSuchUpload => ( // <-- added handler
+            AppError::NoSuchUpload => ( 
                 StatusCode::NOT_FOUND,
                 S3Error::new("NoSuchUpload", "The specified upload does not exist.", "upload")
+            ),
+            AppError::NoSuchVersion => (
+                StatusCode::NOT_FOUND,
+                S3Error::new(
+                    "NoSuchVersion",
+                    "The specified version does not exist.",
+                    "versionId"
+                )
             ),
             AppError::AccessDenied => (
                 StatusCode::FORBIDDEN,
@@ -308,7 +320,12 @@ impl IntoResponse for AppError {
                 StatusCode::BAD_REQUEST,
                 S3Error::new("InvalidArgument", &msg, "argument"),
             ),
-                        AppError::PreconditionFailed => (
+            AppError::InvalidRange(msg) => (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                S3Error::new("InvalidRange", &msg, "range"),
+            ),
+
+            AppError::PreconditionFailed => (
                 StatusCode::PRECONDITION_FAILED,
                 S3Error::new("PreconditionFailed", "Precondition failed", "resource"),
             ),
