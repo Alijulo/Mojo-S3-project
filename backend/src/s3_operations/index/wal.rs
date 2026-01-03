@@ -88,6 +88,34 @@ impl Wal {
 
         Ok(ops)
     }
+
+    /// Load a WAL record by txn_id (linear scan).
+    pub async fn load(&self, txn_id: &str) -> Result<Option<WalOp>> {
+        let mut file = File::open(&self.path).await?;
+        loop {
+            let mut len_buf = [0u8; 4];
+            match file.read_exact(&mut len_buf).await {
+                Ok(_) => (),
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e).context("WAL corruption while loading"),
+            }
+            let len = u32::from_le_bytes(len_buf);
+            let mut buf = vec![0u8; len as usize];
+            file.read_exact(&mut buf).await?;
+            let op: WalOp = serde_json::from_slice(&buf)?;
+            if op.txn_id() == txn_id {
+                return Ok(Some(op));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Append a commit marker for a given txn_id.
+    pub async fn mark_committed(&mut self, txn_id: &str) -> Result<()> {
+        let marker = WalOp::Commit { txn_id: txn_id.to_string() };
+        self.append(&marker).await?;
+        Ok(())
+    }
 }
 
 

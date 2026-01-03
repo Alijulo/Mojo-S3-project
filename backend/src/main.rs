@@ -38,8 +38,7 @@ use s3_operations::object_handlers::{
     delete_object, get_object, head_object, list_objects, put_object,presign_object
 };
 use s3_operations::handler_utils::{S3Headers};
-use s3_operations::background_workers::{
-    BackgroundWorkers,spawn_fsync_worker,spawn_archive_copy_worker,spawn_bucket_meta_worker};
+use s3_operations::background_workers::{BackgroundWorkers,spawn_workers};
 use s3_operations::auth::auth_middleware;
 use s3_operations::user_models::{initialize_database, verify_credentials};
 use s3_operations::jwt_utils::generate_jwt;
@@ -101,6 +100,7 @@ pub struct AppState {
     pub storage_root: PathBuf,
     pub pool: SqlitePool,
     pub store: Arc<dyn ObjectStore>,
+    //pub store: Arc<dyn ObjectStore + Send + Sync>,
     pub io_locks: Arc<IoLocks>,
     pub io_budget: Arc<Semaphore>, // global I/O concurrency budget
     pub durability: DurabilityLevel,              // NEW: durability mode
@@ -108,6 +108,8 @@ pub struct AppState {
     //per-bucket indexes
     pub indexes: Arc<DashMap<String, Arc<BucketIndex>>>,
 }
+
+
 
 impl AppState {
     // Path helpers for consistent, safe path construction
@@ -265,18 +267,7 @@ async fn main() -> Result<()> {
     let (fsync_tx, fsync_rx) = tokio::sync::mpsc::channel(100);
     let (archive_copy_tx, archive_copy_rx) = tokio::sync::mpsc::channel(100);
 
-    // Spawn workers
-    spawn_bucket_meta_worker(bucket_meta_rx, storage_root.clone(), durability);
-    spawn_fsync_worker(fsync_rx);
-    spawn_archive_copy_worker(archive_copy_rx);
-
-    let workers = BackgroundWorkers {
-        bucket_meta_tx,
-        fsync_tx,
-        archive_copy_tx,
-    };
-
-
+  
     // --- Application State ---
     let state = Arc::new(AppState {
         storage_root,
@@ -285,9 +276,17 @@ async fn main() -> Result<()> {
         io_locks: Arc::new(IoLocks::new()),
         io_budget, // NEW field
         durability,                // NEW
-        workers: Some(workers),
+        workers: None,
         indexes: Arc::new(DashMap::new()),
     });
+
+    // Spawn workers after state exists
+    let worker_handles = spawn_workers(state.clone());
+
+    // Now patch in the workers
+    Arc::get_mut(&mut Arc::clone(&state))
+        .expect("no other refs yet")
+        .workers = Some(worker_handles);
 
     // CORS
     let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);

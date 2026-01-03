@@ -15,7 +15,8 @@ use std::{
 use tokio::{sync::{mpsc, RwLock}, task::JoinHandle};
 use tracing::{info, warn};
 use anyhow::Result as AnyhowResult;  // Alias to avoid confusion
-
+use crate::AppState;
+use crate::s3_operations::handler_utils::AppError;
 // ──────────────────────────────────────────────────────
 // Node state with health + latency EMA
 // ──────────────────────────────────────────────────────
@@ -249,17 +250,18 @@ impl ObjectStore for ClusterStore {
         key: &str,
         _opts: PutOptions,
         mut body: Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>,
-    ) -> Result<()> {
+        state: Arc<AppState>,
+    ) -> Result<(String, u64, Option<String>), AppError> {
         let token = Self::key_token(bucket, key);
         let targets = {
             let ring = self.ring.read().await;
             ring.replicas_for(&token, self.replication)
         };
         if targets.is_empty() {
-            return Err(anyhow!("No healthy replicas available"));
+            return Err(AppError::Internal(anyhow::anyhow!("No healthy replicas available")));
         }
 
-        // One channel per replica (bounded for backpressure)
+        // channels per replica
         let mut senders = Vec::<mpsc::Sender<Option<Bytes>>>::with_capacity(targets.len());
         let mut receivers = Vec::<mpsc::Receiver<Option<Bytes>>>::with_capacity(targets.len());
         for _ in 0..targets.len() {
@@ -268,29 +270,19 @@ impl ObjectStore for ClusterStore {
             receivers.push(rx);
         }
 
-        // Spawn per-replica streaming tasks
-        let mut tasks: Vec<JoinHandle<Result<reqwest::Response>>> = Vec::with_capacity(targets.len());
-        for (i, node) in targets.iter().enumerate() {
+        // spawn tasks
+        let mut tasks: Vec<JoinHandle<anyhow::Result<reqwest::Response>>> =
+            Vec::with_capacity(targets.len());
+        for node in targets.iter() {
             let mut rx = receivers.remove(0);
             let url = self.node_put_url(node, bucket, key);
             let client = self.client.clone();
             let timeout = self.timeout;
 
-            // let stream = async_stream::stream! {
-            //     while let Some(item) = rx.recv().await {
-            //         match item {
-            //             Some(bytes) => yield bytes,
-            //             None => break,
-            //         }
-            //     }
-            // };
-
-
-
             let stream = async_stream::stream! {
                 while let Some(item) = rx.recv().await {
                     match item {
-                        Some(bytes) => yield Ok(bytes) as AnyhowResult<Bytes>,  // Explicit cast for clarity
+                        Some(bytes) => yield Ok(bytes) as AnyhowResult<Bytes>,
                         None => break,
                     }
                 }
@@ -298,35 +290,25 @@ impl ObjectStore for ClusterStore {
             let body = Body::wrap_stream(stream);
 
             tasks.push(tokio::spawn(async move {
-                let resp = client
-                    .put(&url)
-                    .body(body)
-                    .timeout(timeout)
-                    .send()
-                    .await;
-                match resp {
-                    Ok(r) => Ok(r),
-                    Err(e) => Err(anyhow!(e)),
-                }
+                let resp = client.put(&url).body(body).timeout(timeout).send().await;
+                resp.map_err(|e| anyhow::anyhow!(e))
             }));
         }
 
-        // Tee input to all replicas (bounded send to enforce backpressure)
+        // tee input
         while let Some(chunk) = body.next().await {
             let bytes = chunk?;
             for tx in &senders {
-                if let Err(_e) = tx.send(Some(bytes.clone())).await {
-                    // Replica channel closed; continue feeding others
+                if tx.send(Some(bytes.clone())).await.is_err() {
                     warn!("Replica channel closed during PUT; continuing");
                 }
             }
         }
-        // Signal EOF
         for tx in &senders {
             let _ = tx.send(None).await;
         }
 
-        // Quorum: wait for enough successes
+        // quorum
         let mut successes = 0usize;
         let mut errors = Vec::new();
         for t in tasks {
@@ -337,22 +319,29 @@ impl ObjectStore for ClusterStore {
                         break;
                     }
                 }
-                Ok(Ok(resp)) => errors.push(anyhow!("PUT status {}", resp.status())),
+                Ok(Ok(resp)) => errors.push(anyhow::anyhow!("PUT status {}", resp.status())),
                 Ok(Err(e)) => errors.push(e),
-                Err(e) => errors.push(anyhow!("join error: {}", e)),
+                Err(e) => errors.push(anyhow::anyhow!("join error: {}", e)),
             }
         }
 
         if successes < self.write_quorum {
-            return Err(anyhow!(
+            return Err(AppError::Internal(anyhow::anyhow!(
                 "Write quorum not met: {successes}/{}; errors: {errors:?}",
                 self.write_quorum
-            ));
+            )));
         }
 
         info!("Cluster PUT {bucket}/{key} quorum={successes}/{}", self.write_quorum);
-        Ok(())
+
+        // placeholder values for etag, size, version_id
+        Ok((
+            "\"etag-placeholder\"".to_string(),
+            0u64,
+            Some("version-placeholder".to_string()),
+        ))
     }
+
 
     // ──────────────────────────────────────────────────
     // GET with latency-biased placement and quorum

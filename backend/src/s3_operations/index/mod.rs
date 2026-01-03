@@ -61,15 +61,26 @@ impl BucketIndex {
             sst_cache: Mutex::new(HashMap::new()),
         })
     }
-
-    pub async fn put(&self, mut entry: IndexEntry) -> Result<()> {
+    pub async fn put(
+        &self,
+        txn_id: String,
+        mut entry: IndexEntry,
+        tmp_path: PathBuf,
+        final_path: PathBuf,
+    ) -> Result<()> {
         // Assign seq
         let mut seq = self.seq_counter.lock().await;
         *seq += 1;
         entry.seq_no = *seq;
         entry.is_delete = false;
 
-        let op = WalOp::Put(entry.clone());
+        let op = WalOp::Put {
+            txn_id,
+            entry: entry.clone(),
+            tmp_path,
+            final_path,
+        };
+
         {
             let mut wal = self.wal.lock().await;
             wal.append(&op).await?;
@@ -78,19 +89,61 @@ impl BucketIndex {
         Ok(())
     }
 
-    pub async fn delete(&self, key: &str) -> Result<()> {
+    pub async fn delete(
+        &self,
+        txn_id: String,
+        key: &str,
+        tmp_path: PathBuf,
+        final_path: PathBuf,
+    ) -> Result<()> {
         let mut seq = self.seq_counter.lock().await;
         *seq += 1;
 
-        let op = WalOp::Delete { key: key.to_string() };
+        let op = WalOp::Delete {
+            txn_id,
+            key: key.to_string(),
+            tmp_path,
+            final_path,
+        };
+
         {
             let mut wal = self.wal.lock().await;
             wal.append(&op).await?;
         }
-        // Apply tombstone with the seq
         self.mem.apply_with_seq(&op, *seq);
         Ok(())
     }
+
+    
+    // pub async fn put(&self, mut entry: IndexEntry) -> Result<()> {
+    //     // Assign seq
+    //     let mut seq = self.seq_counter.lock().await;
+    //     *seq += 1;
+    //     entry.seq_no = *seq;
+    //     entry.is_delete = false;
+
+    //     let op = WalOp::Put(entry.clone());
+    //     {
+    //         let mut wal = self.wal.lock().await;
+    //         wal.append(&op).await?;
+    //     }
+    //     self.mem.apply(&op);
+    //     Ok(())
+    // }
+
+    // pub async fn delete(&self, key: &str) -> Result<()> {
+    //     let mut seq = self.seq_counter.lock().await;
+    //     *seq += 1;
+
+    //     let op = WalOp::Delete { key: key.to_string() };
+    //     {
+    //         let mut wal = self.wal.lock().await;
+    //         wal.append(&op).await?;
+    //     }
+    //     // Apply tombstone with the seq
+    //     self.mem.apply_with_seq(&op, *seq);
+    //     Ok(())
+    // }
 
     // Unified get: consult memtable first, then SSTs in LSM order using cached readers
     pub async fn get(&self, key: &str) -> GetResult {

@@ -9,16 +9,16 @@ pub struct Memtable {
 
 impl Memtable {
     /// Apply a WAL operation with a sequence number (used during WAL replay).
-    pub fn apply_with_seq(&self, op: &WalOp, seq_no: u64) {
+        pub fn apply_with_seq(&self, op: &WalOp, seq_no: u64) {
         match op {
-            WalOp::Put(entry) => {
+            WalOp::Put { entry, .. } => {
                 let mut new_entry = entry.clone();
                 new_entry.seq_no = seq_no;
                 new_entry.is_delete = false;
                 self.map.insert(new_entry.key.clone(), new_entry);
             }
 
-            WalOp::Delete { key } => {
+            WalOp::Delete { key, .. } => {
                 let tombstone = IndexEntry {
                     key: key.clone(),
                     size: 0,
@@ -30,16 +30,43 @@ impl Memtable {
                 };
                 self.map.insert(key.clone(), tombstone);
             }
+
+            WalOp::Commit { .. } => {
+                // Commit markers don’t affect the memtable directly
+            }
         }
     }
+    // pub fn apply_with_seq(&self, op: &WalOp, seq_no: u64) {
+    //     match op {
+    //         WalOp::Put(entry) => {
+    //             let mut new_entry = entry.clone();
+    //             new_entry.seq_no = seq_no;
+    //             new_entry.is_delete = false;
+    //             self.map.insert(new_entry.key.clone(), new_entry);
+    //         }
+
+    //         WalOp::Delete { key } => {
+    //             let tombstone = IndexEntry {
+    //                 key: key.clone(),
+    //                 size: 0,
+    //                 etag: String::new(),
+    //                 last_modified: String::new(),
+    //                 seq_no,
+    //                 is_delete: true,
+    //                 version: None,
+    //             };
+    //             self.map.insert(key.clone(), tombstone);
+    //         }
+    //     }
+    // }
 
     /// Apply a WAL operation during real-time writes (not replay).
     pub fn apply(&self, op: &WalOp) {
         match op {
-            WalOp::Put(entry) => {
+            WalOp::Put { entry, .. } => {
                 self.map.insert(entry.key.clone(), entry.clone());
             }
-            WalOp::Delete { key } => {
+            WalOp::Delete { key, .. } => {
                 // During live PUT/DELETE, tombstones should be stored, not removed
                 let tombstone = IndexEntry {
                     key: key.clone(),
@@ -52,8 +79,33 @@ impl Memtable {
                 };
                 self.map.insert(key.clone(), tombstone);
             }
+            WalOp::Commit { txn_id } => {
+                // Commit markers don’t affect the memtable directly.
+                // You might log them for debugging or metrics if you want visibility.
+                tracing::debug!(%txn_id, "memtable saw commit marker");
+            }
         }
     }
+    // pub fn apply(&self, op: &WalOp) {
+    //     match op {
+    //         WalOp::Put(entry) => {
+    //             self.map.insert(entry.key.clone(), entry.clone());
+    //         }
+    //         WalOp::Delete { key } => {
+    //             // During live PUT/DELETE, tombstones should be stored, not removed
+    //             let tombstone = IndexEntry {
+    //                 key: key.clone(),
+    //                 size: 0,
+    //                 etag: String::new(),
+    //                 last_modified: String::new(),
+    //                 seq_no: 0, // real seq assigned by WAL layer
+    //                 is_delete: true,
+    //                 version: None,
+    //             };
+    //             self.map.insert(key.clone(), tombstone);
+    //         }
+    //     }
+    // }
 
     /// Get a single entry (including tombstones).
     pub fn get(&self, key: &str) -> Option<IndexEntry> {

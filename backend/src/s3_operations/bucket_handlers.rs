@@ -2,7 +2,7 @@ use axum::{
     extract::{Path as AxumPath, State,Extension},
     http::{StatusCode, HeaderMap,header,},
 };
-
+use std::{path::Path};
 use tokio::fs;
 use std::{sync::Arc, io::ErrorKind};
 use anyhow::Context;
@@ -155,6 +155,13 @@ fn validate_bucket_name(bucket: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+pub async fn load_bucket_meta(bucket_path: &Path) -> Result<BucketMeta, AppError> {
+    let marker = bucket_path.join(".s3meta");
+    let data = get(&marker, "user.s3.meta").await.ok().flatten();
+    let json = data.and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_else(|| r#"{"versioning":false,"object_count":0,"used_bytes":0}"#.to_string());
+    serde_json::from_str(&json).map_err(|e| AppError::Internal(e.into()))
+}
 // ====================================================================
 // Router Helpers
 // ====================================================================
